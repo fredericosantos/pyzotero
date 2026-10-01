@@ -34,6 +34,7 @@ from pyzotero.semantic_scholar import (
     get_references as s2_get_references,
     search_papers,
 )
+from pyzotero.duplicates import apply_merge, find_duplicates, match_basis, plan_merge
 from pyzotero.webdav import check_storage
 from pyzotero.zotero import chunks
 
@@ -357,6 +358,45 @@ def storage_check(verify_hashes: bool = False) -> str:
         return _error("storage_check needs storage = webdav (see 'pyzotero setup')")
     report = check_storage(get_zotero_client(), storage, verify_hashes=verify_hashes)
     return _json(report.as_dict())
+
+
+@mcp.tool()
+@mcp_error_handler
+def find_duplicate_items() -> str:
+    """List groups of duplicate items, using Zotero desktop's rules.
+
+    Items match on DOI, on ISBN (books), or on a normalized title with at
+    least one common author and years at most one apart. Each group lists
+    the oldest item first.
+
+    Returns:
+        JSON list of groups: ``basis`` (doi, title, isbn or mixed; check
+        isbn groups by hand, since a proceedings volume and one of its
+        chapters share an ISBN) and ``items`` (key, itemType, title, date,
+        DOI, dateAdded, children).
+
+    """
+    zot = get_zotero_client()
+    groups = find_duplicates(zot.everything(zot.items(limit=100)))
+    return _json(
+        [
+            {
+                "basis": match_basis(g),
+                "items": [
+                    {
+                        "key": i["key"],
+                        **{
+                            f: i["data"].get(f)
+                            for f in ("itemType", "title", "date", "DOI", "dateAdded")
+                        },
+                        "children": i.get("meta", {}).get("numChildren", 0),
+                    }
+                    for i in g
+                ],
+            }
+            for g in groups
+        ]
+    )
 
 
 @mcp.tool()
@@ -777,6 +817,54 @@ def _register_attachment_tools(add: AddTool) -> None:
     add(fetch_pdf)
 
 
+def _register_merge_tools(add: AddTool) -> None:
+    """Register the duplicate merge tool."""
+
+    def merge_items(
+        keys: list[str], master: str = "", fill_empty: bool = False, apply: bool = False
+    ) -> str:
+        """Merge duplicate items into one, as Zotero desktop does.
+
+        The master keeps its fields and gets the others' notes, attachments,
+        collections, tags and relations, and the earliest date added. A PDF
+        that is byte-identical to one of the master's is trashed. The other
+        items go to the trash, from where Zotero can restore them.
+
+        Args:
+            keys: Two or more item keys, for example a group from
+                find_duplicate_items.
+            master: The key to keep. Default: the oldest by dateAdded.
+            fill_empty: Copy fields that are empty on the master from the
+                other items.
+            apply: Make the changes. With False (the default), only the
+                plan is returned: show it to the user before applying.
+
+        Returns:
+            JSON with ``applied`` and the plan: master, trashed items,
+            changed master fields, moved children, trashed duplicate PDFs
+            and items whose related-item links were updated.
+
+        """
+        if len(set(keys)) < 2:  # noqa: PLR2004
+            return _error("Give at least two different item keys")
+        zot = _write_client() if apply else get_zotero_client()
+        if not master:
+            master = min(
+                (zot.item(k) for k in keys),
+                key=lambda i: i["data"].get("dateAdded", ""),
+            )["key"]
+        elif master not in keys:
+            return _error(f"master {master} is not one of the given keys")
+        plan = plan_merge(
+            zot, master, [k for k in keys if k != master], fill_empty=fill_empty
+        )
+        if apply:
+            apply_merge(zot, plan)
+        return _json({"applied": apply, **plan.summary()})
+
+    add(merge_items)
+
+
 def _register_delete_tools(add: AddTool) -> None:
     """Register the delete tools. This runs only for --enable-deletes."""
 
@@ -821,6 +909,7 @@ def register_write_tools(
     _register_item_tools(add)
     _register_collection_tools(add)
     _register_attachment_tools(add)
+    _register_merge_tools(add)
     if enable_deletes:
         _register_delete_tools(add)
     return registered

@@ -47,6 +47,7 @@ from pyzotero.semantic_scholar import (
     get_references,
     search_papers,
 )
+from pyzotero.duplicates import apply_merge, find_duplicates, match_basis, plan_merge
 from pyzotero.webdav import WebDAVStorage, check_storage
 from pyzotero.zotero import chunks
 
@@ -1855,6 +1856,137 @@ def storagecheck(ctx: Any, hashes: bool, output_json: bool) -> None:
             click.echo(line)
     if report["missing"] or report["mismatched"]:
         sys.exit(1)
+
+
+def _brief(item: dict[str, Any]) -> dict[str, Any]:
+    data = item["data"]
+    out = {
+        "key": item["key"],
+        "itemType": data.get("itemType"),
+        "title": data.get("title"),
+        "date": data.get("date"),
+        "DOI": data.get("DOI") or None,
+        "dateAdded": data.get("dateAdded"),
+        "children": item.get("meta", {}).get("numChildren", 0),
+    }
+    return out
+
+
+@main.command()
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def duplicates(ctx: Any, output_json: bool) -> None:
+    """List groups of duplicate items, using Zotero desktop's rules.
+
+    Items match on DOI, on ISBN (books), or on a normalized title, unless
+    their DOIs differ, their years are more than one apart, or no author
+    matches (last name and first initial). Each group lists the oldest item
+    first: 'pyzotero merge' keeps it by default. The "basis" says what the
+    items share; check "isbn" groups by hand, since a proceedings volume and
+    one of its chapters share an ISBN.
+
+    Examples:
+        pyzotero duplicates
+
+        pyzotero duplicates --json
+
+    """
+    zot = _zot_from_ctx(ctx)
+    groups = find_duplicates(zot.everything(zot.items(limit=100)))
+    result: list[dict[str, Any]] = [
+        {"basis": match_basis(g), "items": [_brief(i) for i in g]} for g in groups
+    ]
+    if output_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    for group in result:
+        click.echo(f"[{group['basis']}]")
+        for i in group["items"]:
+            click.echo(
+                f"  {i['key']}  {i['itemType']:<16} added {(i['dateAdded'] or '')[:10]}"
+                f"  {i['children']} children  {(i['title'] or '')[:70]}"
+            )
+    click.echo(f"{len(result)} groups")
+
+
+@main.command()
+@click.argument("keys", nargs=-1, required=True)
+@click.option(
+    "--master", help="Key of the item to keep (default: the oldest by dateAdded)"
+)
+@click.option(
+    "--fill-empty",
+    is_flag=True,
+    help="Copy fields that are empty on the master from the other items",
+)
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    help="Make the changes. Without it, only the plan is shown",
+)
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def merge(
+    ctx: Any,
+    keys: tuple[str, ...],
+    master: str | None,
+    fill_empty: bool,
+    do_apply: bool,
+    output_json: bool,
+) -> None:
+    """Merge duplicate items KEYS into one, as Zotero desktop does.
+
+    The master keeps its fields and gets the others' notes, attachments,
+    collections, tags and relations, and the earliest date added. A PDF
+    that is byte-identical to one of the master's is trashed, and its
+    annotations move to the master's copy. The other items go to the trash,
+    from where Zotero can restore them.
+
+    Without --apply, nothing changes: the plan is printed.
+
+    Examples:
+        pyzotero merge LDBZ4RJ7 N7WHM5XS
+
+        pyzotero merge LDBZ4RJ7 N7WHM5XS --master N7WHM5XS --apply
+
+    """
+    if len(set(keys)) < 2:  # noqa: PLR2004
+        msg = "Give at least two different item keys"
+        raise RuntimeError(msg)
+    zot = _write_zot_from_ctx(ctx) if do_apply else _zot_from_ctx(ctx)
+    if master is None:
+        items = [zot.item(k) for k in keys]
+        master = min(items, key=lambda i: i["data"].get("dateAdded", ""))["key"]
+    elif master not in keys:
+        msg = f"--master {master} is not one of the given keys"
+        raise RuntimeError(msg)
+    plan = plan_merge(
+        zot, master, [k for k in keys if k != master], fill_empty=fill_empty
+    )
+    if do_apply:
+        apply_merge(zot, plan)
+    summary: dict[str, Any] = {"applied": do_apply, **plan.summary()}
+    if output_json:
+        click.echo(json.dumps(summary, indent=2))
+        return
+    m = summary["master"]
+    click.echo(f"Keep:   {m['key']}  {m['title']}")
+    for t in summary["trashed"]:
+        click.echo(f"Trash:  {t['key']}  {t['title']}")
+    click.echo(
+        f"Master fields changed: {', '.join(summary['master_updates']) or 'none'}"
+    )
+    click.echo(
+        f"Children moved: {len(summary['moved_children'])}; duplicate PDFs trashed: {len(summary['trashed_attachments'])}"
+    )
+    if summary["repointed_relations"]:
+        click.echo(
+            f"Related-item links updated on: {', '.join(summary['repointed_relations'])}"
+        )
+    click.echo("Merged." if do_apply else "Nothing changed. Add --apply to merge.")
 
 
 if __name__ == "__main__":
