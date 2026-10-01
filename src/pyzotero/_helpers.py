@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from pyzotero import zotero
+from pyzotero._config import load_settings
 from pyzotero.errors import InvalidItemFieldsError
+from pyzotero.webdav import WebDAVStorage
 
 LOCAL_KEY_ENV = "PYZOTERO_LOCAL_API_KEY"
 LOCAL_SERVER_ID_ENV = "PYZOTERO_LOCAL_SERVER_ID"
@@ -36,14 +38,28 @@ def get_zotero_client(
     server_id: str | None = None,
     local_api_key: str | None = None,
 ) -> zotero.Zotero:
-    """Get a Zotero client that is configured for local access.
+    """Get a Zotero client for the configured mode.
 
-    Without the two optional arguments the client can only read.
-    ``local_api_key`` permits writes (see :meth:`Zotero.authorize_local`),
-    and ``server_id`` supplies a server ID that was kept from an earlier
-    session, which prevents one initial request. :func:`get_write_client`
-    fills both in from the stored key.
+    In ``remote`` mode (see :mod:`pyzotero._config`), the client talks to the
+    zotero.org Web API with the configured API key, and the two optional
+    arguments are ignored. The API key decides whether it can write.
+
+    In ``local`` mode, the client talks to the desktop app. Without the two
+    optional arguments the client can only read. ``local_api_key`` permits
+    writes (see :meth:`Zotero.authorize_local`), and ``server_id`` supplies a
+    server ID that was kept from an earlier session, which prevents one
+    initial request. :func:`get_write_client` fills both in from the stored
+    key.
     """
+    settings = load_settings()
+    if settings.mode == "remote":
+        settings.require_remote()
+        return zotero.Zotero(
+            library_id=settings.library_id,
+            library_type=settings.library_type,
+            api_key=settings.api_key,
+            locale=locale,
+        )
     return zotero.Zotero(
         library_id="0",
         library_type="user",
@@ -107,6 +123,8 @@ def get_write_client(locale: str = "en-US") -> zotero.Zotero:
         RuntimeError: No key is stored and none is set in the environment.
 
     """
+    if load_settings().mode == "remote":
+        return get_zotero_client(locale)
     server_id, key = load_local_key()
     if not key:
         msg = (
@@ -115,6 +133,19 @@ def get_write_client(locale: str = "en-US") -> zotero.Zotero:
         )
         raise RuntimeError(msg)
     return get_zotero_client(locale, server_id=server_id, local_api_key=key)
+
+
+def get_webdav_storage() -> WebDAVStorage | None:
+    """Return the configured WebDAV storage, or None if storage is ``zotero``.
+
+    Raises:
+        ConfigError: Storage is ``webdav`` but its settings are incomplete.
+
+    """
+    settings = load_settings()
+    if settings.storage != "webdav":
+        return None
+    return WebDAVStorage(*settings.webdav_credentials())
 
 
 def describe_item_type(zot: zotero.Zotero, item_type: str) -> dict[str, Any]:
