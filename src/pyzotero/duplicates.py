@@ -273,6 +273,7 @@ def plan_merge(  # noqa: PLR0912, PLR0915
     master_key: str,
     other_keys: list[str],
     fill_empty: bool = False,
+    library: list[dict[str, Any]] | None = None,
 ) -> MergePlan:
     """Work out what merging ``other_keys`` into ``master_key`` changes.
 
@@ -285,6 +286,11 @@ def plan_merge(  # noqa: PLR0912, PLR0915
         fill_empty: Copy a field from another item when the master's is
             empty (the first other item that has it wins). Zotero desktop
             asks per field instead; by default only the master's fields stay.
+        library: All items of the library, as from
+            ``zot.everything(zot.items())``, to find relations that point at
+            the merged items. Pass it to reuse one download across several
+            merges; by default it is downloaded. Versions in it can be stale:
+            :func:`apply_merge` retries those writes with the current one.
 
     Simplifications compared with Zotero desktop:
 
@@ -435,7 +441,9 @@ def plan_merge(  # noqa: PLR0912, PLR0915
     # the library's items.
     other_uris = {_item_uri(zot, o["key"]) for o in others}
     skip = {master_key, *other_keys}
-    for item in zot.everything(zot.items(limit=100)):
+    if library is None:
+        library = zot.everything(zot.items(limit=100))
+    for item in library:
         if item["key"] in skip:
             continue
         rels = dict(item["data"].get("relations") or {})
