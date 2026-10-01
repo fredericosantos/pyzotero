@@ -71,6 +71,23 @@ pyzotero createitem items.json --collection FD9AUNP2 --tag "to read"
 
 Run `pyzotero --help` for the full list of commands, and see the [CLI documentation][13] for details of the write commands, search behaviour, and output formats.
 
+## Remote mode and WebDAV file storage
+
+`pyzotero setup` chooses two independent settings and stores them, with the credentials, in `~/.config/pyzotero/config.json` (mode 0600). Environment variables (`PYZOTERO_MODE`, `PYZOTERO_API_KEY`, `PYZOTERO_WEBDAV_URL`, …; see `pyzotero setup --help`) override the file.
+
+* **mode**: `local` (the desktop app, the default) or `remote` (the zotero.org Web API with an API key). The CLI and MCP server work in both modes, so a headless server needs no desktop app.
+* **storage**: `zotero` (Zotero File Storage, the default) or `webdav`. With `webdav`, attachment files are read from and written to your WebDAV server in the layout Zotero desktop uses (`<KEY>.zip` + `<KEY>.prop`), and the item's `md5`/`mtime` are set so that desktops download new files.
+
+```bash
+pyzotero setup                          # prompts; tests the API key and WebDAV server
+pyzotero attach ABC12345 paper.pdf      # upload to the configured storage
+pyzotero download ABC12345 --out papers/
+pyzotero fetchpdf ABC12345              # open-access PDF from arXiv or Unpaywall
+pyzotero storagecheck --hashes          # library vs. files on the WebDAV server
+```
+
+Zotero syncs only personal libraries to WebDAV, so in a group library, and in local mode (where the desktop app syncs its own files), `attach` uses the API path instead.
+
 # MCP Server
 
 Pyzotero includes an optional [MCP](https://modelcontextprotocol.io) server that exposes your local Zotero library and Semantic Scholar integration as tools.

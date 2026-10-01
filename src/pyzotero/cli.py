@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import IO, Any, TypeVar
 
 import click
 import httpx2
 
-from pyzotero import __version__
+from pyzotero import __version__, _files
+from pyzotero._config import (
+    ENV_VARS,
+    MODES,
+    STORAGES,
+    Settings,
+    config_path,
+    load_settings,
+    save_settings,
+)
 from pyzotero._helpers import (
     annotate_with_library,
     build_doi_index,
@@ -19,6 +30,7 @@ from pyzotero._helpers import (
     describe_item_type,
     format_creators,
     format_s2_paper,
+    get_webdav_storage,
     get_write_client,
     get_zotero_client,
     normalise_doi,
@@ -35,6 +47,7 @@ from pyzotero.semantic_scholar import (
     get_references,
     search_papers,
 )
+from pyzotero.webdav import WebDAVStorage, check_storage
 from pyzotero.zotero import chunks
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -195,7 +208,10 @@ def _run_s2_lookup(
 )
 @click.pass_context
 def main(ctx: Any, locale: str) -> None:
-    """Search and manage a local Zotero library."""
+    """Search and manage a Zotero library: local, or on zotero.org.
+
+    Run 'pyzotero setup' to choose the mode and file storage.
+    """
     ctx.ensure_object(dict)
     ctx.obj["locale"] = locale
 
@@ -1499,6 +1515,346 @@ def s2search(
             indent=2,
         )
     )
+
+
+SECRET_SETTINGS = ("api_key", "webdav_password")
+API_KEY_INFO_URL = "https://api.zotero.org/keys/current"
+
+
+def _masked(settings: Settings) -> dict[str, Any]:
+    shown = settings.to_file_dict()
+    for name in SECRET_SETTINGS:
+        if shown.get(name):
+            shown[name] = "****" + shown[name][-4:]
+    return shown
+
+
+def _ask(
+    value: str | None, text: str, default: str | None, secret: bool = False
+) -> str | None:
+    """Return ``value`` if given, else prompt with ``default``. Blank keeps None."""
+    if value is not None:
+        return value or None
+    if secret and default:
+        answer = click.prompt(
+            f"{text} (Enter keeps the stored one)",
+            default="",
+            hide_input=True,
+            show_default=False,
+        )
+        return answer or default
+    answer = click.prompt(
+        text, default=default or "", hide_input=secret, show_default=bool(default)
+    )
+    return answer or None
+
+
+def _check_api_key(api_key: str) -> dict[str, Any]:
+    """Return the key's info from zotero.org. Raise RuntimeError if invalid."""
+    resp = httpx2.get(API_KEY_INFO_URL, headers={"Zotero-API-Key": api_key}, timeout=30)
+    if resp.status_code == 403:  # noqa: PLR2004
+        msg = "zotero.org rejected the API key"
+        raise RuntimeError(msg)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@main.command()
+@click.option(
+    "--mode",
+    type=click.Choice(MODES),
+    help="local (desktop app) or remote (zotero.org API)",
+)
+@click.option("--api-key", help="zotero.org API key (remote mode)")
+@click.option("--library-id", help="Library ID; default: the API key's user ID")
+@click.option(
+    "--library-type", type=click.Choice(["user", "group"]), help="Default: user"
+)
+@click.option(
+    "--storage",
+    type=click.Choice(STORAGES),
+    help="zotero (Zotero File Storage) or webdav",
+)
+@click.option("--webdav-url", help="WebDAV URL as entered in Zotero, without /zotero")
+@click.option("--webdav-username")
+@click.option("--webdav-password")
+@click.option(
+    "--unpaywall-email", help="Email sent to Unpaywall for DOI lookups (optional)"
+)
+@click.option(
+    "--no-input", is_flag=True, help="Never prompt; use the options and stored values"
+)
+@click.option(
+    "--no-check",
+    is_flag=True,
+    help="Save without testing the API key and WebDAV server",
+)
+@click.option(
+    "--show", is_flag=True, help="Print the current settings (secrets masked) and exit"
+)
+@cli_error_handler
+def setup(
+    mode: str | None,
+    api_key: str | None,
+    library_id: str | None,
+    library_type: str | None,
+    storage: str | None,
+    webdav_url: str | None,
+    webdav_username: str | None,
+    webdav_password: str | None,
+    unpaywall_email: str | None,
+    no_input: bool,
+    no_check: bool,
+    show: bool,
+) -> None:
+    """Choose the library mode and file storage, and save the credentials.
+
+    Options that are not given are prompted for, with the stored value as the
+    default. With --no-input nothing is prompted, so scripts and agents can
+    run it. The API key and the WebDAV server are tested before anything is
+    saved. Environment variables override the saved file:
+
+    \b
+    PYZOTERO_MODE, PYZOTERO_API_KEY, PYZOTERO_LIBRARY_ID,
+    PYZOTERO_LIBRARY_TYPE, PYZOTERO_STORAGE, PYZOTERO_WEBDAV_URL,
+    PYZOTERO_WEBDAV_USERNAME, PYZOTERO_WEBDAV_PASSWORD,
+    PYZOTERO_UNPAYWALL_EMAIL
+
+    Examples:
+        pyzotero setup
+
+        pyzotero setup --show
+
+        pyzotero setup --no-input --mode remote --api-key KEY \\
+            --storage webdav --webdav-url https://dav.example.org \\
+            --webdav-username me --webdav-password secret
+
+    """
+    current = load_settings()
+    if show:
+        click.echo(
+            json.dumps(
+                {"path": str(config_path()), "settings": _masked(current)}, indent=2
+            )
+        )
+        return
+    if no_input:
+
+        def ask(
+            value: str | None, _text: str, default: str | None, secret: bool = False
+        ) -> str | None:
+            return default if value is None else (value or None)
+    else:
+        ask = _ask
+    mode = ask(mode, "Mode (local, remote)", current.mode) or "local"
+    values: dict[str, Any] = {"mode": mode}
+    if mode == "remote":
+        values["api_key"] = ask(
+            api_key,
+            "zotero.org API key (zotero.org/settings/keys)",
+            current.api_key,
+            secret=True,
+        )
+        if not values["api_key"]:
+            msg = "Remote mode needs an API key"
+            raise RuntimeError(msg)
+        info = {} if no_check else _check_api_key(values["api_key"])
+        if info:
+            click.echo(
+                f"API key OK: user {info.get('username')} ({info.get('userID')})",
+                err=True,
+            )
+            access = info.get("access", {}).get("user", {})
+            if not access.get("write"):
+                click.echo("Warning: this key cannot write to your library.", err=True)
+        values["library_type"] = (
+            ask(library_type, "Library type (user, group)", current.library_type)
+            or "user"
+        )
+        default_id = current.library_id or (
+            str(info["userID"])
+            if values["library_type"] == "user" and "userID" in info
+            else None
+        )
+        values["library_id"] = ask(library_id, "Library ID", default_id)
+    values["storage"] = (
+        ask(storage, "File storage (zotero, webdav)", current.storage) or "zotero"
+    )
+    if values["storage"] == "webdav":
+        values["webdav_url"] = ask(
+            webdav_url, "WebDAV URL (without /zotero)", current.webdav_url
+        )
+        values["webdav_username"] = ask(
+            webdav_username, "WebDAV user name", current.webdav_username
+        )
+        values["webdav_password"] = ask(
+            webdav_password, "WebDAV password", current.webdav_password, secret=True
+        )
+    values["unpaywall_email"] = ask(
+        unpaywall_email, "Email for Unpaywall (blank to skip)", current.unpaywall_email
+    )
+    new = Settings(**{k: v for k, v in values.items() if v is not None})
+    if new.mode == "remote":
+        new.require_remote()
+    if new.storage == "webdav":
+        credentials = new.webdav_credentials()
+        if not no_check:
+            WebDAVStorage(*credentials).check()
+            click.echo("WebDAV server OK: readable and writable", err=True)
+    path = save_settings(new)
+    overridden = [var for var in ENV_VARS.values() if os.environ.get(var)]
+    click.echo(f"Saved settings to {path}")
+    if overridden:
+        click.echo(
+            f"Note: these environment variables override the file: {', '.join(overridden)}",
+            err=True,
+        )
+
+
+@main.command()
+@click.argument("parent")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--title", help="Attachment title; default: the file name")
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def attach(
+    ctx: Any, parent: str, file: Path, title: str | None, output_json: bool
+) -> None:
+    """Attach FILE to the item with key PARENT.
+
+    The file goes to the configured storage (see 'pyzotero setup'). If the
+    identical file is already attached, nothing is uploaded.
+
+    Examples:
+        pyzotero attach ABC12345 paper.pdf
+
+        pyzotero attach ABC12345 paper.pdf --title "Preprint" --json
+
+    """
+    result = _files.attach(_write_zot_from_ctx(ctx), parent, file.resolve(), title)
+    if output_json:
+        click.echo(json.dumps(result, indent=2))
+    elif "error" in result:
+        click.echo(f"Error: {result['error']}: {result['detail']}", err=True)
+    elif "unchanged" in result:
+        click.echo(f"Already attached: {result['unchanged']}")
+    else:
+        click.echo(f"Attached {result['filename']} as {result['attached']}")
+    if "error" in result:
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("key")
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path(),
+    help="Directory for the file (default: current directory)",
+)
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def download(ctx: Any, key: str, out_dir: Path, output_json: bool) -> None:
+    """Download the file of attachment KEY, or the PDF of item KEY.
+
+    For a regular item, its first PDF attachment is used, or else its first
+    stored attachment.
+
+    Examples:
+        pyzotero download ABC12345 --out papers/
+
+        pyzotero download ABC12345 --json
+
+    """
+    result = _files.download(_zot_from_ctx(ctx), key, out_dir)
+    if output_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        click.echo(result["path"])
+
+
+@main.command()
+@click.argument("keys", nargs=-1, required=True)
+@click.option("--force", is_flag=True, help="Attach even if the item already has a PDF")
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def fetchpdf(ctx: Any, keys: tuple[str, ...], force: bool, output_json: bool) -> None:
+    """Find an open-access PDF for each item KEY and attach it.
+
+    arXiv is tried first (from the item's arXiv ID), then Unpaywall (from its
+    DOI; needs unpaywall_email, see 'pyzotero setup'). Items that already
+    have a PDF are skipped unless --force is given. A failure for one item is
+    reported and the others continue.
+
+    Examples:
+        pyzotero fetchpdf ABC12345
+
+        pyzotero fetchpdf ABC12345 DEF67890 --json
+
+    """
+    zot = _write_zot_from_ctx(ctx)
+    results = []
+    for key in keys:
+        try:
+            results.append({"key": key, **_files.fetch_pdf(zot, key, force=force)})
+        except Exception as exc:  # noqa: PERF203 -- report per item, continue
+            results.append({"key": key, "error": str(exc)})
+    if output_json:
+        click.echo(json.dumps(results, indent=2))
+    else:
+        for r in results:
+            if "error" in r:
+                click.echo(f"{r['key']}: error: {r['error']}")
+            elif "unchanged" in r:
+                click.echo(f"{r['key']}: already has a PDF ({r['unchanged']})")
+            else:
+                click.echo(f"{r['key']}: attached {r['attached']} from {r['source']}")
+    if any("error" in r for r in results):
+        sys.exit(1)
+
+
+@main.command()
+@click.option(
+    "--hashes",
+    is_flag=True,
+    help="Also compare each .prop hash with the item's md5 (one request per file)",
+)
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def storagecheck(ctx: Any, hashes: bool, output_json: bool) -> None:
+    """Compare the library's attachments with the files on the WebDAV server.
+
+    Reports attachments whose file is missing on the server, attachments no
+    client has uploaded yet, files on the server that no attachment owns
+    (orphaned), and, with --hashes, files whose hash differs from the item.
+    Nothing is changed. Exits 1 if anything is missing or mismatched.
+
+    Examples:
+        pyzotero storagecheck
+
+        pyzotero storagecheck --hashes --json
+
+    """
+    storage = get_webdav_storage()
+    if storage is None:
+        msg = "storagecheck needs storage = webdav (see 'pyzotero setup')"
+        raise RuntimeError(msg)
+    report = check_storage(_zot_from_ctx(ctx), storage, verify_hashes=hashes).as_dict()
+    if output_json:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        for name, keys in report.items():
+            line = f"{name}: {len(keys)}"
+            if keys and name != "ok":
+                line += "  " + " ".join(keys[:20]) + (" ..." if len(keys) > 20 else "")  # noqa: PLR2004
+            click.echo(line)
+    if report["missing"] or report["mismatched"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

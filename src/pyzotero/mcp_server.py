@@ -1,10 +1,9 @@
-"""MCP server exposing local Zotero library access and Semantic Scholar integration."""
+"""MCP server exposing a Zotero library (local or zotero.org) and Semantic Scholar."""
 
 from __future__ import annotations
 
 import argparse
 import functools
-import hashlib
 import json
 import sys
 from collections.abc import Callable
@@ -13,6 +12,7 @@ from typing import Any, TypeVar
 
 from mcp.server.mcpserver import MCPServer
 
+from pyzotero import _files
 from pyzotero._helpers import (
     LOCAL_KEY_ENV,
     LOCAL_SERVER_ID_ENV,
@@ -20,6 +20,7 @@ from pyzotero._helpers import (
     build_doi_index,
     format_creators,
     format_s2_paper,
+    get_webdav_storage,
     get_write_client,
     get_zotero_client,
 )
@@ -33,6 +34,7 @@ from pyzotero.semantic_scholar import (
     get_references as s2_get_references,
     search_papers,
 )
+from pyzotero.webdav import check_storage
 from pyzotero.zotero import chunks
 
 mcp = MCPServer("zotero")
@@ -48,15 +50,6 @@ def _json(obj: Any) -> str:
 def _error(msg: str) -> str:
     """Return a JSON-encoded error message."""
     return _json({"error": msg})
-
-
-def _md5(path: Path) -> str:
-    """Return the hex MD5 digest of a file. Read the file in chunks."""
-    digest = hashlib.md5()  # noqa: S324
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(8192), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _run_s2_tool_lookup(
@@ -319,6 +312,51 @@ def list_tags(collection: str = "") -> str:
     else:
         results = zot.tags()
     return _json(results)
+
+
+@mcp.tool()
+@mcp_error_handler
+def download_attachment(key: str, dest_dir: str) -> str:
+    """Download an attachment's file to a directory, for example to read a PDF.
+
+    Args:
+        key: The key of an attachment, or of a regular item: then its first
+            PDF attachment is used.
+        dest_dir: An absolute path to the directory for the file. It is
+            created if needed.
+
+    Returns:
+        JSON with the attachment key, ``path`` (the main file) and ``files``.
+
+    """
+    dest = Path(dest_dir)
+    if not dest.is_absolute():
+        return _error(f"dest_dir must be an absolute path, got {dest_dir!r}")
+    return _json(_files.download(get_zotero_client(), key, dest))
+
+
+@mcp.tool()
+@mcp_error_handler
+def storage_check(verify_hashes: bool = False) -> str:
+    """Compare the library's attachments with the files on the WebDAV server.
+
+    Only for storage = webdav. Nothing is changed.
+
+    Args:
+        verify_hashes: Also compare each file's hash with the item's md5.
+            This takes one request per attachment.
+
+    Returns:
+        JSON with lists of attachment keys: ok, missing (no file on the
+        server), not_uploaded, mismatched and orphaned (a file that no
+        attachment owns).
+
+    """
+    storage = get_webdav_storage()
+    if storage is None:
+        return _error("storage_check needs storage = webdav (see 'pyzotero setup')")
+    report = check_storage(get_zotero_client(), storage, verify_hashes=verify_hashes)
+    return _json(report.as_dict())
 
 
 @mcp.tool()
@@ -683,14 +721,15 @@ def _register_collection_tools(add: AddTool) -> None:
 
 
 def _register_attachment_tools(add: AddTool) -> None:
-    """Register the file attachment tool."""
+    """Register the file attachment tools."""
 
     def add_attachment(item_key: str, file_path: str, title: str = "") -> str:
         """Attach a file on disk to an existing Zotero item.
 
-        Zotero copies the file into its storage. The attachment stays
-        available if the source file moves or is deleted. If the library
-        syncs, the attachment also syncs.
+        The file goes to the configured storage: the WebDAV server, or Zotero
+        File Storage (see ``pyzotero setup``). The attachment stays available
+        if the source file moves or is deleted. If the library syncs, the
+        attachment also syncs.
 
         Args:
             item_key: The key of the item that gets the attachment.
@@ -714,56 +753,28 @@ def _register_attachment_tools(add: AddTool) -> None:
         if not path.is_absolute():
             msg = f"file_path must be an absolute path, got {file_path!r}"
             raise ValueError(msg)
-        if not path.is_file():
-            msg = f"No file at {file_path}"
-            raise FileNotFoundError(msg)
-        zot = _write_client()
-        # An upload always creates a new attachment item. Without a check, a
-        # call that stops or is retried would attach the file a second time.
-        # Thus, compare the file with the item's attachments first.
-        checksum = _md5(path)
-        for child in zot.children(item_key):
-            data = child.get("data", {})
-            if data.get("filename") == path.name and data.get("md5") == checksum:
-                return _json(
-                    {
-                        "unchanged": child["key"],
-                        "parent": item_key,
-                        "detail": "this file is already attached to the item",
-                    }
-                )
-        # item_template() is not available here: the local API has no
-        # /items/new. Thus, build the attachment template directly. The
-        # upload code finds the contentType from the path.
-        template = {
-            "itemType": "attachment",
-            "linkMode": "imported_file",
-            "title": title or path.name,
-            "filename": str(path),
-            "note": "",
-            "tags": [],
-            "relations": {},
-        }
-        result = zot.upload_attachments([template], item_key)
-        if result["success"]:
-            return _json(
-                {
-                    "attached": result["success"][0]["key"],
-                    "parent": item_key,
-                    "filename": path.name,
-                }
-            )
-        if result["unchanged"]:
-            return _json(
-                {
-                    "unchanged": item_key,
-                    "detail": "an identical file is already attached",
-                }
-            )
-        detail = result["failure"][0] if result["failure"] else None
-        return _json({"error": "Attachment was rejected", "detail": detail})
+        return _json(_files.attach(_write_client(), item_key, path, title or None))
+
+    def fetch_pdf(item_key: str, force: bool = False) -> str:
+        """Find an open-access PDF for an item and attach it.
+
+        arXiv is tried first, from the item's arXiv ID; then Unpaywall, from
+        its DOI.
+
+        Args:
+            item_key: The key of a regular (not attachment) item.
+            force: Attach even if the item already has a stored PDF.
+
+        Returns:
+            JSON with the new attachment's key, the source and the URL; or
+            ``unchanged`` with the existing PDF's key; or the reason no PDF
+            was found.
+
+        """
+        return _json(_files.fetch_pdf(_write_client(), item_key, force=force))
 
     add(add_attachment)
+    add(fetch_pdf)
 
 
 def _register_delete_tools(add: AddTool) -> None:
@@ -819,7 +830,7 @@ def main() -> None:
     """Run the MCP server over stdio transport."""
     parser = argparse.ArgumentParser(
         prog="pyzotero-mcp",
-        description="MCP server exposing a local Zotero library. Read-only by default.",
+        description="MCP server exposing a Zotero library. Read-only by default.",
     )
     parser.add_argument(
         "--enable-writes",
