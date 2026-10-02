@@ -2184,7 +2184,20 @@ def note_append(
 
 @main.command()
 @click.argument("key")
-@click.option("--text", required=True, help="The phrase to highlight, as in the PDF")
+@click.option("--text", help="The phrase to highlight, as in the PDF")
+@click.option(
+    "--rect",
+    "rects",
+    type=(click.IntRange(min=1), float, float, float, float),
+    multiple=True,
+    metavar="PAGE X0 Y0 X1 Y1",
+    help=(
+        "Highlight a rectangle instead of a phrase: 1-based page, then "
+        "x0 y0 x1 y1 in PDF points, origin bottom left. Repeat for more "
+        "rectangles on the same page. The text is taken from the PDF words "
+        "inside. Not with --text"
+    ),
+)
 @click.option(
     "--color",
     default="yellow",
@@ -2211,7 +2224,8 @@ def note_append(
 def highlight(
     ctx: Any,
     key: str,
-    text: str,
+    text: str | None,
+    rects: tuple[tuple[int, float, float, float, float], ...],
     color: str,
     comment: str,
     page: int | None,
@@ -2230,30 +2244,58 @@ def highlight(
     A phrase that occurs more than once needs --occurrence or --all. If the
     same highlight exists, nothing is created.
 
+    With --rect instead of --text, the given rectangles are highlighted, with
+    the text of the PDF words inside them. Coordinates are PDF user space in
+    points with the origin at the bottom left, as in Zotero's annotation
+    position. A rect that overlaps an existing highlight with the same text
+    is reported as unchanged, whatever its color.
+
     Examples:
         pyzotero highlight ABC12345 --text "we introduce a new method"
+
+        pyzotero highlight ABC12345 --rect 1 72 688 300 701 --rect 1 72 674 200 687
 
         pyzotero highlight ABC12345 --text "baseline" --occurrence 2 --color red --comment "check this"
 
         pyzotero highlight ABC12345 --text "baseline" --all --dry-run
 
     """
+    if bool(text) == bool(rects):
+        msg = "Give --text or --rect, not both and not neither"
+        raise click.UsageError(msg)
     if occurrence and all_matches:
         msg = "Give --occurrence or --all, not both"
         raise click.UsageError(msg)
+    if rects and (page or occurrence or all_matches or ignore_case):
+        msg = "--page, --occurrence, --all and --ignore-case go with --text, not --rect"
+        raise click.UsageError(msg)
+    if len({r[0] for r in rects}) > 1:
+        msg = "All --rect must be on the same page"
+        raise click.UsageError(msg)
     zot = _zot_from_ctx(ctx) if dry_run else _write_zot_from_ctx(ctx)
-    result = annotations.highlight(
-        zot,
-        key,
-        text,
-        color=color,
-        comment=comment,
-        page=page or 0,
-        occurrence=occurrence or 0,
-        all_matches=all_matches,
-        ignore_case=ignore_case,
-        dry_run=dry_run,
-    )
+    if rects:
+        result = annotations.highlight_rects(
+            zot,
+            key,
+            rects[0][0],
+            [list(r[1:]) for r in rects],
+            color=color,
+            comment=comment,
+            dry_run=dry_run,
+        )
+    else:
+        result = annotations.highlight(
+            zot,
+            key,
+            text or "",
+            color=color,
+            comment=comment,
+            page=page or 0,
+            occurrence=occurrence or 0,
+            all_matches=all_matches,
+            ignore_case=ignore_case,
+            dry_run=dry_run,
+        )
     if output_json:
         click.echo(json.dumps(result, indent=2))
         return

@@ -873,7 +873,7 @@ def _register_attachment_tools(add: AddTool) -> None:
 
 
 def _register_annotation_tools(add: AddTool) -> None:
-    """Register the highlight tool."""
+    """Register the highlight tools."""
 
     def highlight_text(
         key: str,
@@ -922,7 +922,56 @@ def _register_annotation_tools(add: AddTool) -> None:
             )
         )
 
+    def highlight_rects(
+        key: str,
+        page: int,
+        rects: list[list[float]],
+        text: str = "",
+        color: str = "yellow",
+        comment: str = "",
+    ) -> str:
+        """Highlight rectangles on one PDF page, as a Zotero highlight annotation.
+
+        For callers that know where the text is (for example from OCR) and
+        have no phrase to search for. Needs the ``pdf`` extra
+        (``pyzotero[pdf]``). One annotation is made, with one rect per entry.
+
+        Args:
+            key: The key of a PDF attachment, or of a regular item: then its
+                first PDF attachment is used.
+            page: The page, 1-based.
+            rects: A list of ``[x0, y0, x1, y1]`` in PDF user space: points,
+                origin at the bottom left of the page (the convention of
+                Zotero's annotation position), each with x0 < x1 and
+                y0 < y1, within the page box (CropBox) give or take 2 pt.
+            text: The text of the highlight. Empty: the words of the PDF
+                whose centre lies in the rects. A scanned PDF needs it.
+            color: A Zotero color name (yellow, red, green, blue, purple,
+                magenta, orange, gray) or ``#rrggbb``.
+            comment: Optional comment to store on the highlight.
+
+        Returns:
+            JSON with the attachment key and one highlight: its status
+            (``created``, or ``unchanged`` if a highlight with the same text
+            and overlapping rects exists on the page, whatever its color, so
+            that a retried call is safe), key, page, text and rects; or the
+            reason none was made (bad rects, no words in the rects).
+
+        """
+        return _json(
+            annotations.highlight_rects(
+                _write_client(),
+                key,
+                page,
+                rects,
+                text=text,
+                color=color,
+                comment=comment,
+            )
+        )
+
     add(highlight_text)
+    add(highlight_rects)
 
 
 def _register_merge_tools(add: AddTool) -> None:
