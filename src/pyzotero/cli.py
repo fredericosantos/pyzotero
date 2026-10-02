@@ -13,7 +13,7 @@ from typing import IO, Any, TypeVar
 import click
 import httpx2
 
-from pyzotero import __version__, _files
+from pyzotero import __version__, _files, notes
 from pyzotero._config import (
     ENV_VARS,
     MODES,
@@ -1987,6 +1987,199 @@ def merge(
             f"Related-item links updated on: {', '.join(summary['repointed_relations'])}"
         )
     click.echo("Merged." if do_apply else "Nothing changed. Add --apply to merge.")
+
+
+def _note_markdown(text: str | None, source: IO[str] | None) -> str:
+    """Return the Markdown given by --text or --file, whichever was given."""
+    if source is None and text is not None:
+        return text
+    if text is None and source is not None:
+        return source.read()
+    msg = "Give the note as --text TEXT or --file PATH ('-' reads stdin), not both"
+    raise RuntimeError(msg)
+
+
+_text_option = click.option("--text", help="The note, as Markdown")
+_file_option = click.option(
+    "--file",
+    "source",
+    type=click.File("r", encoding="utf-8"),
+    help="Read the note, as Markdown, from this file, or from '-' for stdin",
+)
+
+
+@main.group()
+def note() -> None:
+    """Create, list, read and extend Zotero notes.
+
+    Notes are written in Markdown and stored as the HTML that Zotero uses.
+    Zotero shows the first line of a note as its title. Supported Markdown:
+    headings, paragraphs, bold, italic, inline code, code blocks, bullet and
+    numbered lists, block quotes, rules and links.
+
+    Put paper-specific details in a child note of the paper.
+    """
+
+
+@note.command("add")
+@click.argument("parent")
+@_text_option
+@_file_option
+@click.option("--title", help="Title: becomes a level-1 heading on the first line")
+@click.option(
+    "--collection",
+    help="Key of a collection to file a standalone note under (PARENT is 'none')",
+)
+@click.option(
+    "--tag",
+    "tags",
+    multiple=True,
+    help="Tag for the note (can be specified multiple times)",
+)
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def note_add(
+    ctx: Any,
+    parent: str,
+    text: str | None,
+    source: IO[str] | None,
+    title: str | None,
+    collection: str | None,
+    tags: tuple[str, ...],
+    output_json: bool,
+) -> None:
+    """Create a note on the item with key PARENT, or a standalone note.
+
+    PARENT is the key of the item that gets the note as a child. Give 'none'
+    for a standalone note, which can go in a collection with --collection.
+
+    Needs a stored local API key, or remote mode: see 'pyzotero setup'.
+
+    Examples:
+        pyzotero note add ABC12345 --text "Uses **tree-based** GP."
+
+        pyzotero note add ABC12345 --title "Reading notes" --file notes.md
+
+        cat notes.md | pyzotero note add ABC12345 --file -
+
+        pyzotero note add none --collection FD9AUNP2 --text "Idea: ..."
+
+    """
+    markdown = _note_markdown(text, source)
+    parent_key = None if parent.lower() == "none" else parent
+    key = notes.add_note(
+        _write_zot_from_ctx(ctx),
+        markdown,
+        title=title or "",
+        parent=parent_key,
+        collection=collection,
+        tags=tags,
+    )
+    if output_json:
+        click.echo(
+            json.dumps(
+                {
+                    "created": key,
+                    "parent": parent_key,
+                    "collection": collection or None,
+                    "tags": list(tags),
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"Created note {key}")
+
+
+@note.command("list")
+@click.argument("parent")
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def note_list(ctx: Any, parent: str, output_json: bool) -> None:
+    """List the notes on the item with key PARENT.
+
+    Shows each note's key, title (its first line) and modification date.
+
+    Examples:
+        pyzotero note list ABC12345
+
+        pyzotero note list ABC12345 --json
+
+    """
+    found = notes.list_notes(_zot_from_ctx(ctx), parent)
+    if output_json:
+        click.echo(json.dumps(found, indent=2))
+        return
+    for n in found:
+        click.echo(f"{n['key']}  {(n['dateModified'] or '')[:10]}  {n['title'][:70]}")
+    click.echo(f"{len(found)} notes")
+
+
+@note.command("show")
+@click.argument("note_key")
+@click.option(
+    "--markdown", is_flag=True, help="Convert the note from HTML to readable Markdown"
+)
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def note_show(ctx: Any, note_key: str, markdown: bool, output_json: bool) -> None:
+    """Print the note with key NOTE_KEY.
+
+    The default output is the HTML that Zotero stores. With --markdown, the
+    HTML becomes Markdown, which is easier to read but not an exact copy.
+
+    Examples:
+        pyzotero note show ABC12345 --markdown
+
+        pyzotero note show ABC12345 --json
+
+    """
+    found = notes.get_note(_zot_from_ctx(ctx), note_key)
+    if markdown:
+        found["markdown"] = notes.html_to_markdown(found["html"])
+    if output_json:
+        click.echo(json.dumps(found, indent=2))
+    elif markdown:
+        click.echo(found["markdown"], nl=False)  # it ends with a newline
+    else:
+        click.echo(found["html"])
+
+
+@note.command("append")
+@click.argument("note_key")
+@_text_option
+@_file_option
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def note_append(
+    ctx: Any,
+    note_key: str,
+    text: str | None,
+    source: IO[str] | None,
+    output_json: bool,
+) -> None:
+    """Append Markdown to the note with key NOTE_KEY.
+
+    Zotero refuses the write if the note changed since it was read. The
+    command then reads the note again and appends once more.
+
+    Examples:
+        pyzotero note append ABC12345 --text "- Follow-up: check ablation."
+
+        pyzotero note append ABC12345 --file more.md
+
+    """
+    result = notes.append_note(
+        _write_zot_from_ctx(ctx), note_key, _note_markdown(text, source)
+    )
+    if output_json:
+        click.echo(json.dumps({"updated": result["key"], "title": result["title"]}))
+    else:
+        click.echo(f"Appended to note {result['key']}: {result['title']}")
 
 
 if __name__ == "__main__":

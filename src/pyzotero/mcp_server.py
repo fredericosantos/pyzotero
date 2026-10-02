@@ -12,7 +12,7 @@ from typing import Any, TypeVar
 
 from mcp.server.mcpserver import MCPServer
 
-from pyzotero import _files
+from pyzotero import _files, notes
 from pyzotero._helpers import (
     LOCAL_KEY_ENV,
     LOCAL_SERVER_ID_ENV,
@@ -397,6 +397,44 @@ def find_duplicate_items() -> str:
             for g in groups
         ]
     )
+
+
+@mcp.tool()
+@mcp_error_handler
+def list_notes(item_key: str) -> str:
+    """List the notes on a Zotero item.
+
+    Args:
+        item_key: The key of the item whose child notes to list.
+
+    Returns:
+        JSON array with the key, title (the note's first line) and
+        dateModified of each note. Use get_note to read one.
+
+    """
+    return _json(notes.list_notes(get_zotero_client(), item_key))
+
+
+@mcp.tool()
+@mcp_error_handler
+def get_note(note_key: str, markdown: bool = True) -> str:
+    """Read a Zotero note.
+
+    Args:
+        note_key: The key of the note, for example from list_notes.
+        markdown: Return the content as Markdown, which is easier to read.
+            With False, the content is the HTML that Zotero stores.
+
+    Returns:
+        JSON with the note's key, version, parent, title, dateModified and
+        content.
+
+    """
+    found = notes.get_note(get_zotero_client(), note_key)
+    html = found.pop("html")
+    found["format"] = "markdown" if markdown else "html"
+    found["content"] = notes.html_to_markdown(html) if markdown else html
+    return _json(found)
 
 
 @mcp.tool()
@@ -865,6 +903,53 @@ def _register_merge_tools(add: AddTool) -> None:
     add(merge_items)
 
 
+def _register_note_tools(add: AddTool) -> None:
+    """Register the tools that create and extend notes."""
+
+    def add_note(parent_key: str, markdown: str, title: str = "") -> str:
+        """Create a note, written in Markdown, on a Zotero item.
+
+        Supported Markdown: headings, paragraphs, bold, italic, inline code,
+        code blocks, bullet and numbered lists, block quotes and links.
+        Zotero shows the first line of a note as its title. Put details that
+        belong to one paper in a note on that paper, not in tags.
+
+        Args:
+            parent_key: The key of the item that gets the note. An empty
+                string makes a standalone note, outside any item.
+            markdown: The note.
+            title: Optional title. It becomes a level-1 heading on the first
+                line, before the Markdown.
+
+        Returns:
+            JSON with the key of the new note.
+
+        """
+        key = notes.add_note(
+            _write_client(), markdown, title=title, parent=parent_key or None
+        )
+        return _json({"created": key, "parent": parent_key or None})
+
+    def append_note(note_key: str, markdown: str) -> str:
+        """Append Markdown to the end of an existing Zotero note.
+
+        Args:
+            note_key: The key of the note, for example from list_notes.
+            markdown: The text to add. Zotero refuses the write if the note
+                changed since it was read. The tool then reads the note again
+                and appends to the new content, once.
+
+        Returns:
+            JSON with the key and title of the updated note.
+
+        """
+        result = notes.append_note(_write_client(), note_key, markdown)
+        return _json({"updated": result["key"], "title": result["title"]})
+
+    add(add_note)
+    add(append_note)
+
+
 def _register_delete_tools(add: AddTool) -> None:
     """Register the delete tools. This runs only for --enable-deletes."""
 
@@ -910,6 +995,7 @@ def register_write_tools(
     _register_collection_tools(add)
     _register_attachment_tools(add)
     _register_merge_tools(add)
+    _register_note_tools(add)
     if enable_deletes:
         _register_delete_tools(add)
     return registered

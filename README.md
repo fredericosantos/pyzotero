@@ -88,6 +88,20 @@ pyzotero storagecheck --hashes          # library vs. files on the WebDAV server
 
 Zotero syncs only personal libraries to WebDAV, so in a group library, and in local mode (where the desktop app syncs its own files), `attach` uses the API path instead.
 
+## Notes
+
+`pyzotero note` creates, lists, reads and extends Zotero notes, so that an agent can write research notes on a paper. You write Markdown (headings, paragraphs, bold, italic, inline code, code blocks, lists, block quotes, links); pyzotero stores it as the HTML that Zotero uses. Zotero shows the first line of a note as its title.
+
+```bash
+pyzotero note add ABC12345 --title "Reading notes" --file notes.md    # a child note of ABC12345
+pyzotero note add none --collection FD9AUNP2 --text "Idea: ..."        # a standalone note
+pyzotero note list ABC12345                                             # key, title, date modified
+pyzotero note show NOTE1234 --markdown                                  # HTML back to readable text
+pyzotero note append NOTE1234 --text "- Follow-up: check the ablation."
+```
+
+`--file -` reads stdin. `append` sends the note's version, so Zotero refuses a stale write; the command then reads the note again and appends once more. The MCP server has the read tools `list_notes` and `get_note`, and, with `--enable-writes`, `add_note` and `append_note`. Not supported: tables, images, footnotes, raw HTML (it is escaped) and LaTeX math.
+
 # MCP Server
 
 Pyzotero includes an optional [MCP](https://modelcontextprotocol.io) server that exposes your local Zotero library and Semantic Scholar integration as tools.
