@@ -116,14 +116,21 @@ class Stream:
     tokens: list[Token]
     text: str = field(init=False)
     starts: list[int] = field(init=False)
+    # Per token, the characters before it that are not white space. This is
+    # the text offset in Zotero's sort index (the app's own highlight of a
+    # title that follows "Semantic Mirror Jailbreak: " has offset 24, not 27).
+    letters: list[int] = field(init=False)
 
     def __post_init__(self) -> None:
         self.text = " ".join(t.text for t in self.tokens)
         self.starts = []
-        pos = 0
+        self.letters = []
+        pos = count = 0
         for token in self.tokens:
             self.starts.append(pos)
+            self.letters.append(count)
             pos += len(token.text) + 1
+            count += len(token.text)
 
     def token_at(self, char: int) -> int:
         """Return the index of the token that holds character ``char``."""
@@ -484,7 +491,9 @@ def _sort_key(page_index: int, offset: int, top: float) -> str:
 
 def sort_index(segment: Segment) -> str:
     """Return Zotero's ``PPPPP|OOOOOO|TTTTT`` sort key for a highlight."""
-    return _sort_key(segment.page.index, segment.offset, segment.top)
+    return _sort_key(
+        segment.page.index, segment.stream.letters[segment.first], segment.top
+    )
 
 
 def _payload(
@@ -839,7 +848,7 @@ def highlight_rects(
                 "pass the text, or fix the rects"
             )
             raise LookupError(msg)
-    offset = target.dropped.starts[inside[0][0]] if inside[0] else 0
+    offset = target.dropped.letters[inside[0][0]] if inside[0] else 0
     sort_key = _sort_key(
         target.index, offset, target.box[3] - max(rect[3] for rect in checked)
     )

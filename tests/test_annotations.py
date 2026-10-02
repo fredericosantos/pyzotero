@@ -275,6 +275,19 @@ class TestRectHeightMatchesZoteroApp:
         assert rect[3] == pytest.approx(700.976, abs=0.05)
         assert annotations.sort_index(seg).endswith("|00091")
 
+    def test_sort_index_offset_skips_white_space(self, tmp_path):
+        # The app's highlight of "Genetic Algorithm" has sort index
+        # 00000|000024|00091: 24 = len("SemanticMirrorJailbreak:").
+        pages = load_synthetic(
+            tmp_path,
+            [(100, 691.077, "Semantic Mirror Jailbreak: Genetic Algorithm")],
+            14.35,
+            690,
+            -209,
+        )
+        seg = one(pages, "Genetic Algorithm").segments[0]
+        assert annotations.sort_index(seg).split("|")[1] == "000024"
+
     def test_five_line_sentence(self, tmp_path):
         # NimbusRomNo9L-Regu, 9.9626 pt: ascent 0.678, descent -0.216
         lines = [
@@ -331,7 +344,8 @@ class TestPayload:
         assert re.fullmatch(r"\d{5}\|\d{6}\|\d{5}", key)
         page, offset, top = key.split("|")
         assert int(page) == 0
-        assert int(offset) == pages[0].dropped.text.index("quick brown")
+        before = pages[0].dropped.text[: pages[0].dropped.text.index("quick brown")]
+        assert int(offset) == len(before.replace(" ", ""))
         assert int(top) == int(PAGE_HEIGHT - seg.rects[0][3])
 
     def test_sort_index_on_second_page(self, pages):
@@ -588,7 +602,7 @@ class TestHighlightRects:
         annotations.highlight_rects(zot, "ATT00001", 1, [rect])
         page, offset, top = created(zot)["annotationSortIndex"].split("|")
         assert int(page) == 0
-        assert int(offset) == pages[0].dropped.text.index("jumps over")
+        assert int(offset) == len("Thequickbrownfox")
         assert int(top) == int(PAGE_HEIGHT - rect[3])
 
     def test_sort_index_top_is_the_highest_rect(self, zot, pages):
