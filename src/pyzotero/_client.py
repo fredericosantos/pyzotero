@@ -1209,6 +1209,8 @@ class Zotero:
             "md5",
             "filename",
             "inPublications",
+            # set by the desktop app when an attachment is opened
+            "lastRead",
             # annotation fields
             "annotationText",
             "annotationColor",

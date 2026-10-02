@@ -244,3 +244,17 @@ def test_update_item_raises_on_rejection():
     zot.check_items = lambda items: items
     with pytest.raises(ze.PreConditionFailedError):
         zot.update_item({"key": "ABCD1234", "version": 1, "title": "x"})
+
+
+def test_check_items_accepts_last_read():
+    """Attachments opened in the desktop app carry lastRead; updates must pass it."""
+    zot = zotero.Zotero("42", "user", "key")
+    zot.item_fields = lambda: [{"field": "title"}]
+    data = {
+        "key": "ABCD1234",
+        "version": 1,
+        "itemType": "attachment",
+        "lastRead": 1790000000,
+        "md5": "a" * 32,
+    }
+    assert zot.check_items([data]) == [data]
