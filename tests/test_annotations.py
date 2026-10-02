@@ -37,8 +37,31 @@ PAGE_TWO = [
 ]
 
 
-def make_pdf(pages: list[list[tuple[float, float, str]]]) -> bytes:
-    """Build a small PDF: one Helvetica line of text per (x, y, text)."""
+def metric_font(ascent: int, descent: int) -> list[bytes]:
+    """Return a font dict and descriptor with the given ascent and descent (per 1000 em)."""
+    widths = " ".join(["500"] * 95)
+    return [
+        (
+            f"<< /Type /Font /Subtype /Type1 /BaseFont /TestSerif /FirstChar 32 "
+            f"/LastChar 126 /Widths [{widths}] /FontDescriptor {{descriptor}} 0 R >>"
+        ).encode(),
+        (
+            f"<< /Type /FontDescriptor /FontName /TestSerif /Flags 34 "
+            f"/Ascent {ascent} /Descent {descent} /CapHeight {ascent} "
+            f"/ItalicAngle 0 /StemV 80 /FontBBox [0 {descent} 1000 {ascent}] >>"
+        ).encode(),
+    ]
+
+
+def make_pdf(
+    pages: list[list[tuple[float, float, str]]],
+    size: float = FONT_SIZE,
+    font: list[bytes] | None = None,
+) -> bytes:
+    """Build a small PDF: one line of text per (x, y, text).
+
+    The font is Helvetica, or the objects of ``font`` (see ``metric_font``).
+    """
     objects: list[bytes] = [b"<< /Type /Catalog /Pages 2 0 R >>", b""]
     kids = []
     font_ref = 3 + 2 * len(pages)
@@ -46,7 +69,7 @@ def make_pdf(pages: list[list[tuple[float, float, str]]]) -> bytes:
         page_ref = 3 + 2 * number
         kids.append(f"{page_ref} 0 R")
         ops = "".join(
-            f"BT /F1 {FONT_SIZE} Tf {x} {y} Td ({_escape(text)}) Tj ET\n"
+            f"BT /F1 {size} Tf {x} {y} Td ({_escape(text)}) Tj ET\n"
             for x, y, text in lines
         ).encode("latin-1")
         objects.append(
@@ -58,7 +81,10 @@ def make_pdf(pages: list[list[tuple[float, float, str]]]) -> bytes:
     objects[1] = (
         f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(pages)} >>".encode()
     )
-    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    if font is None:
+        font = [b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    font[0] = font[0].replace(b"{descriptor}", str(font_ref + 1).encode())
+    objects.extend(font)
     out = b"%PDF-1.4\n"
     offsets = []
     for n, body in enumerate(objects, 1):
@@ -218,6 +244,61 @@ class TestMatching:
         path.write_bytes(make_pdf([[]]))
         with pytest.raises(LookupError, match="no text layer"):
             annotations.load_pages(path)
+
+
+def load_synthetic(tmp_path, lines, size, ascent, descent):
+    path = tmp_path / "metrics.pdf"
+    path.write_bytes(make_pdf([lines], size=size, font=metric_font(ascent, descent)))
+    return annotations.load_pages(path)
+
+
+class TestRectHeightMatchesZoteroApp:
+    """Rects span descent to ascent of the font, as in poppler and the desktop app.
+
+    The expected numbers come from a real paper: a highlight made in the app,
+    and a five-line one checked by eye in it. Here they are rebuilt from the
+    same baselines, sizes and font metrics.
+    """
+
+    def test_title_line(self, tmp_path):
+        # NimbusRomNo9L-Medi, 14.35 pt: ascent 0.69, descent -0.209
+        pages = load_synthetic(
+            tmp_path, [(328.39, 691.077, "Genetic Algorithm")], 14.35, 690, -209
+        )
+        seg = one(pages, "Genetic Algorithm").segments[0]
+        (rect,) = seg.rects
+        assert rect[:2] == pytest.approx([328.39, 688.079], abs=0.05)
+        assert rect[3] == pytest.approx(700.976, abs=0.05)
+        assert annotations.sort_index(seg).endswith("|00091")
+
+    def test_five_line_sentence(self, tmp_path):
+        # NimbusRomNo9L-Regu, 9.9626 pt: ascent 0.678, descent -0.216
+        lines = [
+            (218.681, 430.670, "In this paper,"),
+            (75.007, 418.715, "we introduce a Semantic Mirror Jailbreak (SMJ)"),
+            (75.366, 406.759, "approach that bypasses LLMs by generating jail-"),
+            (75.366, 394.804, "break prompts that are semantically similar to"),
+            (75.366, 382.849, "the original question."),
+        ]
+        pages = load_synthetic(tmp_path, lines, 9.9626, 678, -216)
+        seg = one(
+            pages,
+            "In this paper, we introduce a Semantic Mirror Jailbreak (SMJ) approach "
+            "that bypasses LLMs by generating jailbreak prompts that are "
+            "semantically similar to the original question.",
+        ).segments[0]
+        expected = [
+            (218.681, 428.518, 437.425),
+            (75.007, 416.563, 425.47),
+            (75.366, 404.607, 413.514),
+            (75.366, 392.652, 401.559),
+            (75.366, 380.697, 389.604),
+        ]
+        assert len(seg.rects) == len(expected)
+        for rect, (x1, y1, y2) in zip(seg.rects, expected, strict=True):
+            assert rect[0] == pytest.approx(x1, abs=0.05)
+            assert rect[1] == pytest.approx(y1, abs=0.05)
+            assert rect[3] == pytest.approx(y2, abs=0.05)
 
 
 class TestPayload:

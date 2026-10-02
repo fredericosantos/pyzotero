@@ -27,8 +27,8 @@ import json
 import re
 import tempfile
 import unicodedata
-from itertools import pairwise
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -272,6 +272,37 @@ def _pdfplumber() -> Any:
     return pdfplumber
 
 
+def _read_words(pdf: Any, plumber_page: Any) -> list[dict[str, Any]]:
+    """Return the words of a page, with the vertical extent the Zotero app uses.
+
+    pdfplumber boxes a character as one font size tall, from the descent up.
+    Poppler (``pdftotext -bbox``) and the desktop reader box it from the
+    descent to the ascent that the font descriptor gives, which is shorter
+    (0.89 of the size for a typical serif). Only the top changes.
+    """
+    words = plumber_page.extract_words(
+        use_text_flow=True, x_tolerance_ratio=SPACE_RATIO, return_chars=True
+    )
+    # pdfminer caches the fonts it loaded for this page, keyed by object id.
+    extents = {
+        f.fontname: (f.get_ascent(), f.get_descent())
+        for f in pdf.rsrcmgr._cached_fonts.values()
+    }
+    for word in words:
+        tops = []
+        for char in word["chars"]:
+            ascent, descent = extents.get(char["fontname"], (0, 0))
+            if ascent <= 0 or not char["upright"]:
+                # No ascent to use, or text that runs sideways: keep the
+                # pdfplumber box, which is taller but never too short.
+                tops.append(char["top"])
+                continue
+            baseline = char["bottom"] + descent * char["size"]
+            tops.append(baseline - ascent * char["size"])
+        word["top"] = min(tops)
+    return words
+
+
 def load_pages(path: Path, page: int = 0) -> list[PageText]:
     """Read the text and word positions of a PDF.
 
@@ -295,10 +326,7 @@ def load_pages(path: Path, page: int = 0) -> list[PageText]:
         for index, plumber_page in enumerate(pdf.pages):
             if page and index != page - 1:
                 continue
-            words = plumber_page.extract_words(
-                use_text_flow=True, x_tolerance_ratio=SPACE_RATIO
-            )
-            dropped, kept = _streams(words)
+            dropped, kept = _streams(_read_words(pdf, plumber_page))
             label = labels[index] if index < len(labels) else str(index + 1)
             pages.append(
                 PageText(
@@ -442,7 +470,8 @@ def build_payload(
         "annotationPageLabel": segment.page.label,
         "annotationSortIndex": sort_index(segment),
         "annotationPosition": json.dumps(
-            {"pageIndex": segment.page.index, "rects": segment.rects}
+            {"pageIndex": segment.page.index, "rects": segment.rects},
+            separators=(",", ":"),
         ),
         "tags": [],
         "relations": {},

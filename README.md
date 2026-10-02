@@ -115,7 +115,7 @@ pyzotero annotations ABC12345                                    # key, type, co
 
 `KEY` is a PDF attachment, or an item (then its first PDF attachment is used; `annotations` lists all of its PDFs). Matching ignores white space, ligatures, quote and dash styles, and a hyphen at a line break (`jail-` + `break` matches `jailbreak` and `jail-break`); it is case-sensitive unless you pass `--ignore-case`. A phrase may span lines and columns. A phrase that spans a page break gets one highlight per page. Without a match, the error lists the closest passages. With several matches, it lists them with their pages, and you choose with `--occurrence N` (1-based), `--all` or `--page N`. If the same highlight (same page, text and place) exists, the command reports `unchanged` and creates nothing, so a retry is safe. The MCP server has the read tool `list_annotations` and, with `--enable-writes`, `highlight_text`.
 
-Highlights cover whole words: a phrase that starts or ends inside a word covers that word. Not supported: scanned PDFs without a text layer (run OCR first), rotated pages, and phrases that span more than two pages. A highlight's rectangles come from pdfplumber's word boxes, which reach about 1 pt higher than the ones the desktop app draws.
+Highlights cover whole words: a phrase that starts or ends inside a word covers that word. Not supported: scanned PDFs without a text layer (run OCR first), rotated pages, and phrases that span more than two pages. A highlight's rectangles run from each font's descent to its ascent, the same boxes as `pdftotext -bbox` and the desktop app.
 
 # MCP Server
 
