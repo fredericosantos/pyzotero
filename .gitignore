@@ -11,3 +11,6 @@ __pycache__/
 coverage.xml
 ip
 shell.py
+
+# Claude Code worktrees and local state
+.claude/
