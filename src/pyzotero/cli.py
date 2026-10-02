@@ -13,7 +13,7 @@ from typing import IO, Any, TypeVar
 import click
 import httpx2
 
-from pyzotero import __version__, _files, notes
+from pyzotero import __version__, _files, annotations, notes
 from pyzotero._config import (
     ENV_VARS,
     MODES,
@@ -2180,6 +2180,118 @@ def note_append(
         click.echo(json.dumps({"updated": result["key"], "title": result["title"]}))
     else:
         click.echo(f"Appended to note {result['key']}: {result['title']}")
+
+
+@main.command()
+@click.argument("key")
+@click.option("--text", required=True, help="The phrase to highlight, as in the PDF")
+@click.option(
+    "--color",
+    default="yellow",
+    show_default=True,
+    help="Zotero color name (yellow, red, green, blue, purple, magenta, orange, gray) or #rrggbb",
+)
+@click.option("--comment", default="", help="Comment to store on the highlight")
+@click.option(
+    "--page", type=click.IntRange(min=1), help="Search only this page (1-based)"
+)
+@click.option(
+    "--occurrence",
+    type=click.IntRange(min=1),
+    help="Highlight the Nth match (1-based) when the phrase occurs more than once",
+)
+@click.option("--all", "all_matches", is_flag=True, help="Highlight every match")
+@click.option("--ignore-case", is_flag=True, help="Match without regard to case")
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would be created; write nothing"
+)
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def highlight(
+    ctx: Any,
+    key: str,
+    text: str,
+    color: str,
+    comment: str,
+    page: int | None,
+    occurrence: int | None,
+    all_matches: bool,
+    ignore_case: bool,
+    dry_run: bool,
+    output_json: bool,
+) -> None:
+    """Highlight a phrase in the PDF of attachment or item KEY.
+
+    The phrase is found in the PDF text (needs 'pip install pyzotero[pdf]')
+    and stored as a Zotero highlight annotation. It may span lines, columns
+    and, as one highlight per page, a page break. Matching ignores white
+    space, ligatures, quote and dash styles, and a hyphen at a line break.
+    A phrase that occurs more than once needs --occurrence or --all. If the
+    same highlight exists, nothing is created.
+
+    Examples:
+        pyzotero highlight ABC12345 --text "we introduce a new method"
+
+        pyzotero highlight ABC12345 --text "baseline" --occurrence 2 --color red --comment "check this"
+
+        pyzotero highlight ABC12345 --text "baseline" --all --dry-run
+
+    """
+    if occurrence and all_matches:
+        msg = "Give --occurrence or --all, not both"
+        raise click.UsageError(msg)
+    zot = _zot_from_ctx(ctx) if dry_run else _write_zot_from_ctx(ctx)
+    result = annotations.highlight(
+        zot,
+        key,
+        text,
+        color=color,
+        comment=comment,
+        page=page or 0,
+        occurrence=occurrence or 0,
+        all_matches=all_matches,
+        ignore_case=ignore_case,
+        dry_run=dry_run,
+    )
+    if output_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    for h in result["highlights"]:
+        click.echo(
+            f"{h['status']:9}  {h['key'] or '-':8}  p.{h['label']}  {h['text'][:70]}"
+        )
+    if dry_run:
+        click.echo("Nothing changed: this was a dry run.")
+
+
+@main.command("annotations")
+@click.argument("key")
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+@cli_error_handler
+def annotations_command(ctx: Any, key: str, output_json: bool) -> None:
+    """List the annotations on the PDF of attachment or item KEY.
+
+    Shows each annotation's key, type, color, page label, text and comment.
+    For an item, the annotations of all its PDF attachments.
+
+    Examples:
+        pyzotero annotations ABC12345
+
+        pyzotero annotations ABC12345 --json
+
+    """
+    rows = annotations.list_annotations(_zot_from_ctx(ctx), key)
+    if output_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        line = (
+            f"{r['key']}  {r['type']:9}  {r['color']}  p.{r['page']}  {r['text'][:60]}"
+        )
+        click.echo(f"{line}  // {r['comment']}" if r["comment"] else line)
+    click.echo(f"{len(rows)} annotations")
 
 
 if __name__ == "__main__":
