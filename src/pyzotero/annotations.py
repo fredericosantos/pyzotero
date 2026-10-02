@@ -7,6 +7,10 @@ The work splits in three, so that the first two run without a network:
    match into the item that the Zotero API takes.
 3. :func:`highlight` downloads the PDF, runs the two steps and writes.
 
+:func:`highlight_rects` highlights given rectangles instead of a phrase, for
+callers that know where the text is (for example from OCR). It needs no text
+layer if the caller passes the text.
+
 Coordinates in the payload are PDF user space in points, with the origin at
 the bottom left. pdfplumber measures from the top, so ``y = height - top``.
 
@@ -24,11 +28,12 @@ from __future__ import annotations
 import bisect
 import difflib
 import json
+import math
 import re
 import tempfile
 import unicodedata
 from dataclasses import dataclass, field
-from itertools import pairwise
+from itertools import islice, pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -111,14 +116,21 @@ class Stream:
     tokens: list[Token]
     text: str = field(init=False)
     starts: list[int] = field(init=False)
+    # Per token, the characters before it that are not white space. This is
+    # the text offset in Zotero's sort index (the app's own highlight of a
+    # title that follows "Semantic Mirror Jailbreak: " has offset 24, not 27).
+    letters: list[int] = field(init=False)
 
     def __post_init__(self) -> None:
         self.text = " ".join(t.text for t in self.tokens)
         self.starts = []
-        pos = 0
+        self.letters = []
+        pos = count = 0
         for token in self.tokens:
             self.starts.append(pos)
+            self.letters.append(count)
             pos += len(token.text) + 1
+            count += len(token.text)
 
     def token_at(self, char: int) -> int:
         """Return the index of the token that holds character ``char``."""
@@ -135,6 +147,9 @@ class PageText:
     rotation: int
     dropped: Stream
     kept: Stream
+    # The visible page in PDF user space: CropBox within MediaBox,
+    # as (x0, y0, x1, y1) with the origin at the bottom left.
+    box: tuple[float, float, float, float]
 
 
 @dataclass
@@ -186,8 +201,9 @@ class Segment:
 
     @property
     def top(self) -> float:
-        """Distance in points from the page top to the first line."""
-        return min(b.top for b in self.lines[0])
+        """Distance in points from the top of the visible page to the first line."""
+        page = self.page
+        return min(b.top for b in self.lines[0]) - (page.height - page.box[3])
 
 
 @dataclass
@@ -303,11 +319,30 @@ def _read_words(pdf: Any, plumber_page: Any) -> list[dict[str, Any]]:
     return words
 
 
-def load_pages(path: Path, page: int = 0) -> list[PageText]:
+def _user_box(plumber_page: Any) -> tuple[float, float, float, float]:
+    """Return the visible box of a page in PDF user space (origin bottom left).
+
+    pdfplumber keeps the CropBox out of its page size and flips the boxes it
+    reports, so ``y = height - y_plumber`` gives user space again. The
+    CropBox is cut to the MediaBox, as readers do.
+    """
+    height = float(plumber_page.height)
+
+    def user(box: tuple[float, float, float, float]) -> tuple[float, ...]:
+        return (box[0], height - box[3], box[2], height - box[1])
+
+    media, crop = user(plumber_page.mediabox), user(plumber_page.cropbox)
+    x0, y0 = max(media[0], crop[0]), max(media[1], crop[1])
+    x1, y1 = min(media[2], crop[2]), min(media[3], crop[3])
+    return (x0, y0, x1, y1)
+
+
+def load_pages(path: Path, page: int = 0, require_text: bool = True) -> list[PageText]:
     """Read the text and word positions of a PDF.
 
     ``page`` is 1-based: with it, only that page is read. Raises LookupError
-    if no page has text (a scanned PDF) and IndexError for a page out of range.
+    if no page has text (a scanned PDF), unless ``require_text`` is false,
+    and IndexError for a page out of range.
     """
     pdfplumber = _pdfplumber()
     from pdfminer.pdfdocument import PDFNoPageLabels  # noqa: PLC0415
@@ -319,7 +354,8 @@ def load_pages(path: Path, page: int = 0) -> list[PageText]:
             msg = f"Page {page} is out of range: the PDF has {total} pages"
             raise IndexError(msg)
         try:
-            labels = list(pdf.doc.get_page_labels())
+            # pdfminer's label stream never ends: the last range runs on forever.
+            labels = list(islice(pdf.doc.get_page_labels(), total))
         except PDFNoPageLabels:
             # Without page labels Zotero labels a page with its number.
             labels = []
@@ -336,9 +372,10 @@ def load_pages(path: Path, page: int = 0) -> list[PageText]:
                     int(plumber_page.rotation),
                     dropped,
                     kept,
+                    _user_box(plumber_page),
                 )
             )
-    if not any(p.dropped.tokens for p in pages):
+    if require_text and not any(p.dropped.tokens for p in pages):
         msg = "The PDF has no text layer (a scanned PDF?): run OCR on it first"
         raise LookupError(msg)
     return pages
@@ -448,34 +485,56 @@ def closest(pages: list[PageText], phrase: str, count: int = 3) -> list[str]:
     return [text for score, text in best if score >= _MIN_SIMILARITY]
 
 
+def _sort_key(page_index: int, offset: int, top: float) -> str:
+    return f"{page_index:05d}|{min(offset, 999999):06d}|{min(int(top), 99999):05d}"
+
+
 def sort_index(segment: Segment) -> str:
     """Return Zotero's ``PPPPP|OOOOOO|TTTTT`` sort key for a highlight."""
-    return (
-        f"{segment.page.index:05d}|{min(segment.offset, 999999):06d}"
-        f"|{min(int(segment.top), 99999):05d}"
+    return _sort_key(
+        segment.page.index, segment.stream.letters[segment.first], segment.top
     )
+
+
+def _payload(
+    attachment: str,
+    page: PageText,
+    text: str,
+    rects: list[list[float]],
+    sort_key: str,
+    color: str,
+    comment: str,
+) -> dict[str, Any]:
+    return {
+        "itemType": "annotation",
+        "parentItem": attachment,
+        "annotationType": "highlight",
+        "annotationText": text,
+        "annotationComment": comment,
+        "annotationColor": parse_color(color),
+        "annotationPageLabel": page.label,
+        "annotationSortIndex": sort_key,
+        "annotationPosition": json.dumps(
+            {"pageIndex": page.index, "rects": rects}, separators=(",", ":")
+        ),
+        "tags": [],
+        "relations": {},
+    }
 
 
 def build_payload(
     attachment: str, segment: Segment, color: str, comment: str = ""
 ) -> dict[str, Any]:
     """Return the annotation item that the Zotero API creates for a segment."""
-    return {
-        "itemType": "annotation",
-        "parentItem": attachment,
-        "annotationType": "highlight",
-        "annotationText": segment.text,
-        "annotationComment": comment,
-        "annotationColor": parse_color(color),
-        "annotationPageLabel": segment.page.label,
-        "annotationSortIndex": sort_index(segment),
-        "annotationPosition": json.dumps(
-            {"pageIndex": segment.page.index, "rects": segment.rects},
-            separators=(",", ":"),
-        ),
-        "tags": [],
-        "relations": {},
-    }
+    return _payload(
+        attachment,
+        segment.page,
+        segment.text,
+        segment.rects,
+        sort_index(segment),
+        color,
+        comment,
+    )
 
 
 def select(
@@ -599,6 +658,48 @@ def _entry(status: str, payload: dict[str, Any], key: str | None) -> dict[str, A
     }
 
 
+def _first_attachment(zot: Zotero, key: str) -> str:
+    attachments = pdf_attachments(zot, key)
+    if not attachments:
+        msg = f"Item {key} has no stored PDF attachment"
+        raise LookupError(msg)
+    return attachments[0]["key"]
+
+
+def _store(
+    zot: Zotero,
+    attachment: str,
+    payloads: list[dict[str, Any]],
+    found: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Create the payloads that do not exist yet, and report each one."""
+    existing = _annotations_of(zot, attachment)
+    entries: list[dict[str, Any]] = []
+    pending: list[tuple[int, dict[str, Any]]] = []
+    for payload in payloads:
+        if duplicate := find_duplicate(payload, existing):
+            entries.append(_entry("unchanged", payload, duplicate))
+        else:
+            pending.append((len(entries), payload))
+            entries.append(_entry("planned", payload, None))
+    if pending and not dry_run:
+        response = zot.create_items([p for _, p in pending])
+        success = response.get("success") or {}
+        if len(success) != len(pending):
+            msg = f"Zotero rejected the highlight: {response.get('failed')}"
+            raise RuntimeError(msg)
+        for n, (slot, _) in enumerate(pending):
+            entries[slot]["status"] = "created"
+            entries[slot]["key"] = success[str(n)]
+    return {
+        "attachment": attachment,
+        "dry_run": dry_run,
+        "found": found,
+        "highlights": entries,
+    }
+
+
 def highlight(
     zot: Zotero,
     key: str,
@@ -621,11 +722,7 @@ def highlight(
     Zotero rejects a write.
     """
     parse_color(color)
-    attachments = pdf_attachments(zot, key)
-    if not attachments:
-        msg = f"Item {key} has no stored PDF attachment"
-        raise LookupError(msg)
-    attachment = attachments[0]["key"]
+    attachment = _first_attachment(zot, key)
     with tempfile.TemporaryDirectory() as tmp:
         downloaded = _files.download(zot, attachment, Path(tmp))
         pages = load_pages(Path(downloaded["path"]), page)
@@ -643,27 +740,117 @@ def highlight(
         for match in chosen
         for segment in match.segments
     ]
-    existing = _annotations_of(zot, attachment)
-    entries: list[dict[str, Any]] = []
-    pending: list[tuple[int, dict[str, Any]]] = []
-    for payload in payloads:
-        if duplicate := find_duplicate(payload, existing):
-            entries.append(_entry("unchanged", payload, duplicate))
-        else:
-            pending.append((len(entries), payload))
-            entries.append(_entry("planned", payload, None))
-    if pending and not dry_run:
-        response = zot.create_items([p for _, p in pending])
-        success = response.get("success") or {}
-        if len(success) != len(pending):
-            msg = f"Zotero rejected the highlight: {response.get('failed')}"
-            raise RuntimeError(msg)
-        for n, (slot, _) in enumerate(pending):
-            entries[slot]["status"] = "created"
-            entries[slot]["key"] = success[str(n)]
-    return {
-        "attachment": attachment,
-        "dry_run": dry_run,
-        "found": len(matches),
-        "highlights": entries,
-    }
+    return _store(zot, attachment, payloads, len(matches), dry_run)
+
+
+# Rectangles may stick out of the page box by this much (points): hand-made
+# or OCR-derived boxes are often a little loose at the edge.
+RECT_MARGIN = 2.0
+
+
+def validate_rects(rects: list[list[float]]) -> list[list[float]]:
+    """Return ``rects`` as ``[x0, y0, x1, y1]`` floats, rounded like the text path.
+
+    Raises ValueError for an empty list, a rect that is not four finite numbers,
+    or one with ``x0 >= x1`` or ``y0 >= y1``.
+    """
+    if not rects:
+        msg = "Give at least one rect"
+        raise ValueError(msg)
+    checked = []
+    for rect in rects:
+        try:
+            x0, y0, x1, y1 = (float(v) for v in rect)
+        except (TypeError, ValueError) as exc:
+            msg = f"Rect {rect!r} is not four numbers [x0, y0, x1, y1]"
+            raise ValueError(msg) from exc
+        if not all(math.isfinite(v) for v in (x0, y0, x1, y1)):
+            msg = f"Rect {rect!r} has a value that is not finite"
+            raise ValueError(msg)
+        if not (x0 < x1 and y0 < y1):
+            msg = f"Rect {rect!r} needs x0 < x1 and y0 < y1 (origin bottom left)"
+            raise ValueError(msg)
+        checked.append([round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3)])
+    return checked
+
+
+def _check_in_page(page: PageText, rects: list[list[float]]) -> None:
+    bx0, by0, bx1, by1 = page.box
+    for rect in rects:
+        if (
+            rect[0] < bx0 - RECT_MARGIN
+            or rect[1] < by0 - RECT_MARGIN
+            or rect[2] > bx1 + RECT_MARGIN
+            or rect[3] > by1 + RECT_MARGIN
+        ):
+            msg = (
+                f"Rect {rect} is outside page {page.index + 1}, whose box is "
+                f"[{bx0:g}, {by0:g}, {bx1:g}, {by1:g}] (+-{RECT_MARGIN:g} pt)"
+            )
+            raise ValueError(msg)
+
+
+def _words_in(page: PageText, rect: list[float]) -> list[int]:
+    """Return the indexes of the tokens that have a box centred inside ``rect``."""
+    found = []
+    for n, token in enumerate(page.dropped.tokens):
+        for box in token.boxes:
+            cx = (box.x0 + box.x1) / 2
+            cy = page.height - (box.top + box.bottom) / 2
+            if rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]:
+                found.append(n)
+                break
+    return found
+
+
+def highlight_rects(
+    zot: Zotero,
+    key: str,
+    page: int,
+    rects: list[list[float]],
+    text: str = "",
+    color: str = "yellow",
+    comment: str = "",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Highlight rectangles on one page of the PDF of ``key``.
+
+    ``page`` is 1-based. ``rects`` are ``[x0, y0, x1, y1]`` in PDF user space
+    (points, origin bottom left), the convention of Zotero's
+    ``annotationPosition``. Without ``text``, it is the words of the PDF
+    whose centre lies in a rect, in reading order; with ``text`` the PDF
+    needs no text layer. The sort index takes its text offset from the first
+    word in the first rect (0 if there is none).
+
+    The result has the shape of :func:`highlight`'s, with one entry. A
+    highlight on the same page with overlapping rects and the same text is
+    ``unchanged``, whatever its color. Raises ValueError for bad rects or a
+    rotated page, IndexError for a page out of range, LookupError if no
+    attachment is found or no word is in the rects and ``text`` is empty.
+    """
+    parse_color(color)
+    checked = validate_rects(rects)
+    attachment = _first_attachment(zot, key)
+    with tempfile.TemporaryDirectory() as tmp:
+        downloaded = _files.download(zot, attachment, Path(tmp))
+        (target,) = load_pages(Path(downloaded["path"]), page, require_text=False)
+    if target.rotation:
+        msg = f"Page {page} is rotated, which is not supported"
+        raise ValueError(msg)
+    _check_in_page(target, checked)
+    inside = [_words_in(target, rect) for rect in checked]
+    if not normalize(text):
+        words = sorted({n for found in inside for n in found})
+        text = " ".join(target.dropped.tokens[n].text for n in words)
+        if not text:
+            msg = (
+                f"No words of page {page} lie in the rects: "
+                "pass the text, or fix the rects"
+            )
+            raise LookupError(msg)
+    offset = target.dropped.letters[inside[0][0]] if inside[0] else 0
+    sort_key = _sort_key(
+        target.index, offset, target.box[3] - max(rect[3] for rect in checked)
+    )
+    payload = _payload(attachment, target, text, checked, sort_key, color, comment)
+    return _store(zot, attachment, [payload], 1, dry_run)

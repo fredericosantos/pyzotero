@@ -57,10 +57,14 @@ def make_pdf(
     pages: list[list[tuple[float, float, str]]],
     size: float = FONT_SIZE,
     font: list[bytes] | None = None,
+    media: str = f"0 0 612 {PAGE_HEIGHT}",
+    page_extra: str = "",
 ) -> bytes:
     """Build a small PDF: one line of text per (x, y, text).
 
     The font is Helvetica, or the objects of ``font`` (see ``metric_font``).
+    ``media`` is the MediaBox, ``page_extra`` more entries of the page dict
+    (a CropBox, a Rotate).
     """
     objects: list[bytes] = [b"<< /Type /Catalog /Pages 2 0 R >>", b""]
     kids = []
@@ -73,7 +77,7 @@ def make_pdf(
             for x, y, text in lines
         ).encode("latin-1")
         objects.append(
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 {PAGE_HEIGHT}] "
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [{media}] {page_extra} "
             f"/Contents {page_ref + 1} 0 R "
             f"/Resources << /Font << /F1 {font_ref} 0 R >> >> >>".encode()
         )
@@ -271,6 +275,19 @@ class TestRectHeightMatchesZoteroApp:
         assert rect[3] == pytest.approx(700.976, abs=0.05)
         assert annotations.sort_index(seg).endswith("|00091")
 
+    def test_sort_index_offset_skips_white_space(self, tmp_path):
+        # The app's highlight of "Genetic Algorithm" has sort index
+        # 00000|000024|00091: 24 = len("SemanticMirrorJailbreak:").
+        pages = load_synthetic(
+            tmp_path,
+            [(100, 691.077, "Semantic Mirror Jailbreak: Genetic Algorithm")],
+            14.35,
+            690,
+            -209,
+        )
+        seg = one(pages, "Genetic Algorithm").segments[0]
+        assert annotations.sort_index(seg).split("|")[1] == "000024"
+
     def test_five_line_sentence(self, tmp_path):
         # NimbusRomNo9L-Regu, 9.9626 pt: ascent 0.678, descent -0.216
         lines = [
@@ -327,7 +344,8 @@ class TestPayload:
         assert re.fullmatch(r"\d{5}\|\d{6}\|\d{5}", key)
         page, offset, top = key.split("|")
         assert int(page) == 0
-        assert int(offset) == pages[0].dropped.text.index("quick brown")
+        before = pages[0].dropped.text[: pages[0].dropped.text.index("quick brown")]
+        assert int(offset) == len(before.replace(" ", ""))
         assert int(top) == int(PAGE_HEIGHT - seg.rects[0][3])
 
     def test_sort_index_on_second_page(self, pages):
@@ -337,7 +355,9 @@ class TestPayload:
     def test_rotated_page_is_refused(self, pages):
         seg = one(pages, "quick brown").segments[0]
         rotated = annotations.Segment(
-            annotations.PageText(0, "1", 792, 90, seg.page.dropped, seg.page.kept),
+            annotations.PageText(
+                0, "1", 792, 90, seg.page.dropped, seg.page.kept, seg.page.box
+            ),
             seg.first,
             seg.last,
             seg.offset,
@@ -475,6 +495,324 @@ class TestHighlight:
             annotations.highlight(zot, "ATT00001", "quick brown")
 
 
+def rect_of(pages, phrase) -> list[float]:
+    """Return the rect of the first line of ``phrase``, as the text path makes it."""
+    return one(pages, phrase).segments[0].rects[0]
+
+
+def with_pdf(path: Path):
+    return patch(
+        "pyzotero.annotations._files.download",
+        return_value={"attachment": "ATT00001", "path": str(path)},
+    )
+
+
+def created(zot) -> dict:
+    (payloads,) = zot.create_items.call_args[0]
+    (payload,) = payloads
+    return payload
+
+
+class TestValidateRects:
+    def test_converts_to_rounded_floats(self):
+        assert annotations.validate_rects([(1, 2, 3, 4), ["1.23456", 2, 3.5, 4]]) == [
+            [1.0, 2.0, 3.0, 4.0],
+            [1.235, 2.0, 3.5, 4.0],
+        ]
+
+    @pytest.mark.parametrize(
+        ("rects", "message"),
+        [
+            ([], "at least one"),
+            ([[1, 2, 3]], "four numbers"),
+            ([["a", 2, 3, 4]], "four numbers"),
+            ([[1, 2, 3, None]], "four numbers"),
+            ([[1, 2, float("nan"), 4]], "not finite"),
+            ([[5, 2, 5, 4]], "x0 < x1"),
+            ([[6, 2, 5, 4]], "x0 < x1"),
+            ([[1, 4, 3, 2]], "y0 < y1"),
+        ],
+    )
+    def test_rejects(self, rects, message):
+        with pytest.raises(ValueError, match=message):
+            annotations.validate_rects(rects)
+
+
+class TestHighlightRects:
+    def test_fills_text_from_words_and_matches_the_text_highlight(self, zot, pages):
+        seg = one(pages, "quick brown").segments[0]
+        expected = annotations.build_payload("ATT00001", seg, "blue", "c")
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 1, seg.rects, color="blue", comment="c"
+        )
+        (entry,) = result["highlights"]
+        assert (entry["status"], entry["key"], entry["text"]) == (
+            "created",
+            "NEW00000",
+            "quick brown",
+        )
+        assert created(zot) == expected
+        # compact JSON, as the text path writes it
+        assert " " not in created(zot)["annotationPosition"]
+
+    def test_text_is_in_reading_order_across_rects(self, zot, pages):
+        first, last = rect_of(pages, "quick"), rect_of(pages, "lazy dog and")
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 1, [last, first], dry_run=True
+        )
+        assert result["highlights"][0]["text"] == "quick lazy dog and"
+
+    def test_explicit_text_is_kept(self, zot, pages):
+        annotations.highlight_rects(
+            zot, "ATT00001", 1, [rect_of(pages, "quick")], text="Quick!"
+        )
+        assert created(zot)["annotationText"] == "Quick!"
+
+    def test_page_label_and_index(self, zot, pages):
+        annotations.highlight_rects(zot, "ATT00001", 2, [rect_of(pages[1:], "story")])
+        payload = created(zot)
+        assert payload["annotationPageLabel"] == "2"
+        assert json.loads(payload["annotationPosition"])["pageIndex"] == 1
+        assert payload["annotationSortIndex"].startswith("00001|")
+
+    def test_page_labels_from_the_pdf(self, zot, tmp_path):
+        data = make_pdf([PAGE_ONE]).replace(
+            b"/Type /Catalog",
+            b"/Type /Catalog /PageLabels << /Nums [0 << /S /r /St 4 >>] >>",
+        )
+        path = tmp_path / "labels.pdf"
+        path.write_bytes(data)
+        with with_pdf(path):
+            annotations.highlight_rects(zot, "ATT00001", 1, [[72, 698, 100, 710]])
+        assert created(zot)["annotationPageLabel"] == "iv"
+
+    def test_load_pages_ends_with_page_labels(self, tmp_path):
+        """The pdfminer label iterator is infinite: a PDF with /PageLabels hung."""
+        path = tmp_path / "labels.pdf"
+        path.write_bytes(
+            make_pdf([PAGE_ONE, PAGE_TWO]).replace(
+                b"/Type /Catalog",
+                b"/Type /Catalog /PageLabels << /Nums [0 << /S /r >>] >>",
+            )
+        )
+        assert [p.label for p in annotations.load_pages(path)] == ["i", "ii"]
+
+    def test_sort_index_offset_and_top(self, zot, pages):
+        rect = rect_of(pages, "jumps over")
+        annotations.highlight_rects(zot, "ATT00001", 1, [rect])
+        page, offset, top = created(zot)["annotationSortIndex"].split("|")
+        assert int(page) == 0
+        assert int(offset) == len("Thequickbrownfox")
+        assert int(top) == int(PAGE_HEIGHT - rect[3])
+
+    def test_sort_index_top_is_the_highest_rect(self, zot, pages):
+        low, high = rect_of(pages, "lazy dog"), rect_of(pages, "quick")
+        annotations.highlight_rects(zot, "ATT00001", 1, [low, high])
+        top = created(zot)["annotationSortIndex"].split("|")[2]
+        assert int(top) == int(PAGE_HEIGHT - max(low[3], high[3]))
+
+    def test_offset_is_zero_without_a_word_in_the_first_rect(self, zot, pages):
+        empty = [400, 300, 450, 320]
+        annotations.highlight_rects(
+            zot, "ATT00001", 1, [empty, rect_of(pages, "quick")], text="x"
+        )
+        assert created(zot)["annotationSortIndex"].split("|")[1] == "000000"
+
+    def test_no_word_in_rects_needs_text(self, zot):
+        with pytest.raises(LookupError, match="pass the text"):
+            annotations.highlight_rects(zot, "ATT00001", 1, [[400, 300, 450, 320]])
+        zot.create_items.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("rect", "ok"),
+        [
+            ([0, 0, 612, 792], True),
+            ([-2, -2, 614, 794], True),
+            ([-2.5, 0, 100, 100], False),
+            ([0, 0, 614.5, 100], False),
+            ([0, 0, 100, 795], False),
+            ([0, -3, 100, 100], False),
+        ],
+    )
+    def test_page_box_margin(self, zot, rect, ok):
+        if ok:
+            annotations.highlight_rects(zot, "ATT00001", 1, [rect], text="x")
+        else:
+            with pytest.raises(ValueError, match="outside page 1"):
+                annotations.highlight_rects(zot, "ATT00001", 1, [rect], text="x")
+
+    def test_invalid_rect_fails_before_any_download(self, zot, _local_pdf):
+        with pytest.raises(ValueError, match="x0 < x1"):
+            annotations.highlight_rects(zot, "ATT00001", 1, [[5, 5, 5, 9]])
+        _local_pdf.assert_not_called()
+
+    def test_page_out_of_range(self, zot):
+        with pytest.raises(IndexError, match="out of range"):
+            annotations.highlight_rects(zot, "ATT00001", 3, [[1, 1, 5, 5]], text="x")
+
+    def test_unknown_color(self, zot):
+        with pytest.raises(ValueError, match="Unknown color"):
+            annotations.highlight_rects(
+                zot, "ATT00001", 1, [[1, 1, 5, 5]], color="teal"
+            )
+
+    def test_dry_run_writes_nothing(self, zot, pages):
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 1, [rect_of(pages, "quick")], dry_run=True
+        )
+        assert result["highlights"][0]["status"] == "planned"
+        assert result["dry_run"] is True
+        zot.create_items.assert_not_called()
+
+    def test_item_key_resolves_to_its_pdf(self, zot, pages):
+        zot.item.return_value = {"key": "ITEM0001", "data": {"itemType": "book"}}
+        zot.children.return_value = [attachment_item("ATT00001")]
+        result = annotations.highlight_rects(
+            zot, "ITEM0001", 1, [rect_of(pages, "quick")], dry_run=True
+        )
+        assert result["attachment"] == "ATT00001"
+
+    def test_scanned_pdf_works_with_text(self, zot, tmp_path):
+        path = tmp_path / "scan.pdf"
+        path.write_bytes(make_pdf([[]]))
+        with with_pdf(path):
+            annotations.highlight_rects(
+                zot, "ATT00001", 1, [[72, 600, 300, 620]], text="from OCR"
+            )
+            with pytest.raises(LookupError, match="pass the text"):
+                annotations.highlight_rects(zot, "ATT00001", 1, [[72, 600, 300, 620]])
+        assert created(zot)["annotationText"] == "from OCR"
+
+    def test_rotated_page_is_refused(self, zot, tmp_path):
+        path = tmp_path / "rot.pdf"
+        path.write_bytes(make_pdf([PAGE_ONE], page_extra="/Rotate 90"))
+        with with_pdf(path), pytest.raises(ValueError, match="rotated"):
+            annotations.highlight_rects(zot, "ATT00001", 1, [[72, 600, 100, 620]])
+
+    def test_rejected_write_raises(self, zot, pages):
+        zot.create_items.side_effect = None
+        zot.create_items.return_value = {"success": {}, "failed": {"0": "bad"}}
+        with pytest.raises(RuntimeError, match="rejected"):
+            annotations.highlight_rects(zot, "ATT00001", 1, [rect_of(pages, "quick")])
+
+
+class TestHighlightRectsIdempotency:
+    @pytest.fixture
+    def existing(self, zot, pages):
+        rect = rect_of(pages, "quick brown")
+        annotations.highlight_rects(zot, "ATT00001", 1, [rect], color="green")
+        zot.children.return_value = [annotation_child(created(zot))]
+        zot.create_items.reset_mock()
+        return rect
+
+    def test_same_rect_and_text_is_unchanged_whatever_the_color(self, zot, existing):
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 1, [existing], color="red"
+        )
+        assert result["highlights"][0]["status"] == "unchanged"
+        assert result["highlights"][0]["key"] == "OLD00001"
+        zot.create_items.assert_not_called()
+
+    def test_overlapping_rect_is_unchanged(self, zot, existing):
+        nudged = [existing[0] + 1, existing[1] + 1, existing[2] - 1, existing[3] - 1]
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 1, [nudged], text="quick brown"
+        )
+        assert result["highlights"][0]["status"] == "unchanged"
+
+    def test_other_text_is_created(self, zot, existing):
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 1, [existing], text="something else"
+        )
+        assert result["highlights"][0]["status"] == "created"
+
+    def test_disjoint_rect_is_created(self, zot, existing, pages):
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 1, [rect_of(pages, "lazy dog")], text="quick brown"
+        )
+        assert result["highlights"][0]["status"] == "created"
+
+    def test_same_rect_on_another_page_is_created(self, zot, existing):
+        result = annotations.highlight_rects(
+            zot, "ATT00001", 2, [existing], text="quick brown"
+        )
+        assert result["highlights"][0]["status"] == "created"
+
+    def test_text_highlight_is_the_same_highlight(self, zot, existing):
+        """A phrase highlight and a rect highlight of the same words dedupe."""
+        result = annotations.highlight(zot, "ATT00001", "quick brown")
+        assert result["highlights"][0]["status"] == "unchanged"
+
+
+class TestCropBoxAndMediaBox:
+    CROP = "/CropBox [0 100 612 700]"
+
+    def pdf(self, tmp_path, **kwargs):
+        path = tmp_path / "boxed.pdf"
+        path.write_bytes(
+            make_pdf(
+                [[(72, 650, "Alpha beta gamma"), (72, 400, "Delta epsilon")]], **kwargs
+            )
+        )
+        return path
+
+    def test_load_pages_box(self, tmp_path):
+        (plain,) = annotations.load_pages(self.pdf(tmp_path))
+        assert plain.box == (0, 0, 612, 792)
+        (cropped,) = annotations.load_pages(self.pdf(tmp_path, page_extra=self.CROP))
+        assert cropped.box == (0, 100, 612, 700)
+
+    def test_crop_outside_media_is_cut(self, tmp_path):
+        path = self.pdf(tmp_path, page_extra="/CropBox [-10 -20 700 900]")
+        assert annotations.load_pages(path)[0].box == (0, 0, 612, 792)
+
+    def test_sort_top_is_measured_from_the_crop_top(self, zot, tmp_path):
+        path = self.pdf(tmp_path, page_extra=self.CROP)
+        (page,) = annotations.load_pages(path)
+        rect = [72, 648, 140, 660]
+        with with_pdf(path):
+            result = annotations.highlight_rects(zot, "ATT00001", 1, [rect])
+        assert result["highlights"][0]["text"] == "Alpha beta"
+        # absolute coordinates are kept, the top is below the crop top (700)
+        assert created(zot)["annotationSortIndex"] == "00000|000000|00040"
+        assert page.box[3] - rect[3] == 40  # noqa: PLR2004
+
+    def test_rect_outside_the_crop_box_is_refused(self, zot, tmp_path):
+        path = self.pdf(tmp_path, page_extra=self.CROP)
+        with with_pdf(path):
+            # inside the MediaBox, 5 pt above the CropBox top: more than the margin
+            with pytest.raises(ValueError, match="outside page 1"):
+                annotations.highlight_rects(
+                    zot, "ATT00001", 1, [[72, 690, 140, 705]], text="x"
+                )
+            # inside the crop box top margin
+            annotations.highlight_rects(
+                zot, "ATT00001", 1, [[72, 690, 140, 701.5]], text="x"
+            )
+
+    def test_text_highlight_and_rect_highlight_sort_alike_on_a_cropped_page(
+        self, zot, tmp_path
+    ):
+        path = self.pdf(tmp_path, page_extra=self.CROP)
+        pages = annotations.load_pages(path)
+        seg = one(pages, "Alpha beta").segments[0]
+        with with_pdf(path):
+            annotations.highlight_rects(zot, "ATT00001", 1, seg.rects)
+        assert created(zot)["annotationSortIndex"] == annotations.sort_index(seg)
+
+    def test_media_box_with_an_origin(self, zot, tmp_path):
+        path = self.pdf(tmp_path, media="0 50 612 842")
+        (page,) = annotations.load_pages(path)
+        assert page.box == (0, 50, 612, 842)
+        with with_pdf(path):
+            result = annotations.highlight_rects(
+                zot, "ATT00001", 1, [[72, 648, 140, 660]]
+            )
+        assert result["highlights"][0]["text"] == "Alpha beta"
+        # distance from the top of the visible page: 842 - 660
+        assert created(zot)["annotationSortIndex"].endswith("|00182")
+
+
 class TestListAnnotations:
     def test_rows_in_reading_order(self, zot, pages):
         late = annotations.build_payload(
@@ -564,6 +902,83 @@ class TestCli:
         assert result.exit_code == 1
         assert "2 matches" in result.output
 
+    def test_rect_json(self, runner, zot, pages):
+        x0, y0, x1, y1 = (str(v) for v in rect_of(pages, "quick brown"))
+        result = runner.invoke(
+            cli.main,
+            [
+                *["highlight", "ATT00001", "--rect", "1", x0, y0, x1, y1],
+                *["--color", "blue", "--comment", "hi", "--json"],
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        out = json.loads(result.output)
+        assert out["highlights"][0]["status"] == "created"
+        assert out["highlights"][0]["text"] == "quick brown"
+        assert out["highlights"][0]["color"] == "#2ea8e5"
+        assert created(zot)["annotationComment"] == "hi"
+
+    def test_repeated_rect_makes_one_multi_rect_highlight(self, runner, zot, pages):
+        first, second = rect_of(pages, "quick"), rect_of(pages, "lazy dog")
+        args = ["highlight", "ATT00001"]
+        for r in (first, second):
+            args += ["--rect", "1", *(str(v) for v in r)]
+        result = runner.invoke(cli.main, args)
+        assert result.exit_code == 0, result.output
+        position = json.loads(created(zot)["annotationPosition"])
+        assert position["rects"] == [first, second]
+        assert "quick lazy dog" in result.output
+
+    def test_rect_dry_run_uses_read_client(self, zot, pages):
+        with (
+            patch("pyzotero.cli.get_write_client") as write,
+            patch("pyzotero.cli.get_zotero_client", return_value=zot),
+        ):
+            result = CliRunner().invoke(
+                cli.main,
+                [
+                    "highlight",
+                    "ATT00001",
+                    "--dry-run",
+                    "--rect",
+                    "1",
+                    "72",
+                    "698",
+                    "90",
+                    "712",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        write.assert_not_called()
+        assert "planned" in result.output
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            (["--text", "x", "--rect", "1", "1", "1", "5", "5"], "--text or --rect"),
+            ([], "--text or --rect"),
+            (
+                ["--rect", "1", "1", "1", "5", "5", "--rect", "2", "1", "1", "5", "5"],
+                "same page",
+            ),
+            (["--rect", "1", "1", "1", "5", "5", "--page", "1"], "go with --text"),
+            (["--rect", "1", "1", "1", "5", "5", "--all"], "go with --text"),
+            (["--rect", "0", "1", "1", "5", "5"], "Invalid value"),
+            (["--rect", "1", "1", "1", "5"], "requires 5 arguments"),
+        ],
+    )
+    def test_rect_usage_errors(self, runner, args, message):
+        result = runner.invoke(cli.main, ["highlight", "ATT00001", *args])
+        assert result.exit_code != 0, result.output
+        assert message in result.output
+
+    def test_bad_rect_exits_with_the_reason(self, runner):
+        result = runner.invoke(
+            cli.main, ["highlight", "ATT00001", "--rect", "1", "50", "50", "10", "60"]
+        )
+        assert result.exit_code == 1
+        assert "x0 < x1" in result.output
+
     def test_annotations_listing(self, runner, zot, pages):
         payload = annotations.build_payload(
             "ATT00001", one(pages, "quick brown").segments[0], "yellow", "hi"
@@ -630,3 +1045,25 @@ class TestMcp:
                 server.tools["highlight_text"]("ATT00001", "nonexistent")
             )
         assert "No match" in result["error"]
+
+    def test_highlight_rects_registered_only_with_writes(self):
+        assert not hasattr(mcp_server, "highlight_rects")
+        server = _FakeServer()
+        names = mcp_server.register_write_tools(server)
+        assert "highlight_rects" in names
+        assert "highlight_rects" in server.tools
+
+    def test_highlight_rects(self, zot, pages):
+        server = _FakeServer()
+        mcp_server.register_write_tools(server)
+        rect = rect_of(pages, "quick brown")
+        with patch("pyzotero.mcp_server._write_client", return_value=zot):
+            result = json.loads(
+                server.tools["highlight_rects"]("ATT00001", 1, [rect], color="green")
+            )
+            bad = json.loads(
+                server.tools["highlight_rects"]("ATT00001", 1, [[5, 5, 1, 9]])
+            )
+        assert result["highlights"][0]["status"] == "created"
+        assert result["highlights"][0]["text"] == "quick brown"
+        assert "x0 < x1" in bad["error"]
