@@ -12,7 +12,7 @@ from typing import Any, TypeVar
 
 from mcp.server.mcpserver import MCPServer
 
-from pyzotero import _files, notes
+from pyzotero import _files, annotations, notes
 from pyzotero._helpers import (
     LOCAL_KEY_ENV,
     LOCAL_SERVER_ID_ENV,
@@ -439,6 +439,23 @@ def get_note(note_key: str, markdown: bool = True) -> str:
 
 @mcp.tool()
 @mcp_error_handler
+def list_annotations(key: str) -> str:
+    """List the annotations (highlights) on a PDF in the Zotero library.
+
+    Args:
+        key: The key of a PDF attachment, or of a regular item: then the
+            annotations of all its PDF attachments.
+
+    Returns:
+        JSON array, in reading order, with each annotation's key, attachment,
+        type, color, page (the page label), text and comment.
+
+    """
+    return _json(annotations.list_annotations(get_zotero_client(), key))
+
+
+@mcp.tool()
+@mcp_error_handler
 def get_fulltext(key: str) -> str:
     """Get full-text content of a Zotero attachment.
 
@@ -855,6 +872,59 @@ def _register_attachment_tools(add: AddTool) -> None:
     add(fetch_pdf)
 
 
+def _register_annotation_tools(add: AddTool) -> None:
+    """Register the highlight tool."""
+
+    def highlight_text(
+        key: str,
+        text: str,
+        color: str = "yellow",
+        comment: str = "",
+        page: int = 0,
+        occurrence: int = 0,
+    ) -> str:
+        """Highlight a phrase in a PDF, as a Zotero highlight annotation.
+
+        The phrase is found in the PDF text (the server needs the ``pdf``
+        extra: ``pyzotero[pdf]``). It may span lines and columns. Matching
+        ignores white space, ligatures, quote and dash styles, and a hyphen
+        at a line break. A phrase that spans a page break gets one highlight
+        per page. A scanned PDF without text is rejected.
+
+        Args:
+            key: The key of a PDF attachment, or of a regular item: then its
+                first PDF attachment is used.
+            text: The phrase to highlight, as it reads in the PDF.
+            color: A Zotero color name (yellow, red, green, blue, purple,
+                magenta, orange, gray) or ``#rrggbb``.
+            comment: Optional comment to store on the highlight.
+            page: Search only this page (1-based). 0 searches the whole PDF.
+            occurrence: If the phrase occurs more than once, which match to
+                highlight (1-based). 0 means the phrase must occur once;
+                otherwise the call fails and lists each match with its page.
+
+        Returns:
+            JSON with the attachment key and, per highlight, its status
+            (``created``, or ``unchanged`` if the same highlight exists, so
+            that a retried call is safe), key, page, text and rects; or the
+            reason no highlight was made (no match, several matches).
+
+        """
+        return _json(
+            annotations.highlight(
+                _write_client(),
+                key,
+                text,
+                color=color,
+                comment=comment,
+                page=page,
+                occurrence=occurrence,
+            )
+        )
+
+    add(highlight_text)
+
+
 def _register_merge_tools(add: AddTool) -> None:
     """Register the duplicate merge tool."""
 
@@ -996,6 +1066,7 @@ def register_write_tools(
     _register_attachment_tools(add)
     _register_merge_tools(add)
     _register_note_tools(add)
+    _register_annotation_tools(add)
     if enable_deletes:
         _register_delete_tools(add)
     return registered

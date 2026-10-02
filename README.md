@@ -102,6 +102,21 @@ pyzotero note append NOTE1234 --text "- Follow-up: check the ablation."
 
 `--file -` reads stdin. `append` sends the note's version, so Zotero refuses a stale write; the command then reads the note again and appends once more. The MCP server has the read tools `list_notes` and `get_note`, and, with `--enable-writes`, `add_note` and `append_note`. Not supported: tables, images, footnotes, raw HTML (it is escaped) and LaTeX math.
 
+## Highlights
+
+`pyzotero highlight` finds a phrase in an item's PDF and stores it as a Zotero highlight annotation, which shows in the desktop reader. `pyzotero annotations` lists what is there. Both need the `pdf` extra (`pdfplumber`): `uv add "pyzotero[pdf]"`.
+
+```bash
+pyzotero highlight ABC12345 --text "we introduce a new method" --color blue --comment "key claim"
+pyzotero highlight ABC12345 --text "baseline" --occurrence 2     # the phrase occurs more than once
+pyzotero highlight ABC12345 --text "baseline" --all --dry-run    # show what would be made
+pyzotero annotations ABC12345                                    # key, type, color, page, text, comment
+```
+
+`KEY` is a PDF attachment, or an item (then its first PDF attachment is used; `annotations` lists all of its PDFs). Matching ignores white space, ligatures, quote and dash styles, and a hyphen at a line break (`jail-` + `break` matches `jailbreak` and `jail-break`); it is case-sensitive unless you pass `--ignore-case`. A phrase may span lines and columns. A phrase that spans a page break gets one highlight per page. Without a match, the error lists the closest passages. With several matches, it lists them with their pages, and you choose with `--occurrence N` (1-based), `--all` or `--page N`. If the same highlight (same page, text and place) exists, the command reports `unchanged` and creates nothing, so a retry is safe. The MCP server has the read tool `list_annotations` and, with `--enable-writes`, `highlight_text`.
+
+Highlights cover whole words: a phrase that starts or ends inside a word covers that word. Not supported: scanned PDFs without a text layer (run OCR first), rotated pages, and phrases that span more than two pages. A highlight's rectangles run from each font's descent to its ascent, the same boxes as `pdftotext -bbox` and the desktop app.
+
 # MCP Server
 
 Pyzotero includes an optional [MCP](https://modelcontextprotocol.io) server that exposes your local Zotero library and Semantic Scholar integration as tools.

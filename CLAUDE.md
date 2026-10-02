@@ -5,7 +5,7 @@ Fork of [urschrei/pyzotero](https://github.com/urschrei/pyzotero) at `fredericos
 ## Git
 
 - `origin` is the fork, `upstream` is urschrei. Merge into the fork's `main` only; never open a PR or push to upstream without an explicit request.
-- Keep fork-only code in its own modules (`_config.py`, `_files.py`, `webdav.py`, `openaccess.py`, `duplicates.py`, `notes.py`) and keep edits to upstream files small, so rebasing onto upstream stays cheap.
+- Keep fork-only code in its own modules (`_config.py`, `_files.py`, `webdav.py`, `openaccess.py`, `duplicates.py`, `notes.py`, `annotations.py`) and keep edits to upstream files small, so rebasing onto upstream stays cheap.
 - Worktrees: `.claude/worktrees/<name>` (gitignored).
 
 ## Checks
@@ -24,6 +24,7 @@ uv run pytest -q -p no:cacheprovider --no-cov
 - `dateAdded` is writable via PATCH.
 - `dc:relation` (related items) is kept symmetric by the server: removing a link from one side has no effect while the other side still has it; removing it from either side removes both.
 - Annotation items (`itemType: "annotation"`, child of a PDF attachment) can be created via the API and show in the desktop reader. `annotationPosition` is a JSON string `{"pageIndex", "rects": [[x1, y1, x2, y2]]}` in PDF user space (points, origin bottom-left). From `pdftotext -bbox` (origin top-left): `y1 = pageHeight - yMax`, `y2 = pageHeight - yMin`. A highlight made in the desktop app had exactly these coordinates. `annotationSortIndex` is `PPPPP|OOOOOO|TTTTT` (page index, text offset, top in points).
+- Annotation rect height is the font's descent to ascent (FontDescriptor `Ascent`/`Descent` times size), which is what `pdftotext -bbox` and the desktop app use, not the font size: the app's own highlight of a 14.35 pt title is 12.897 pt tall (0.899 of the size), and 8.907 pt for 9.96 pt text. pdfplumber boxes a character one font size tall, so its tops are 1 to 1.5 pt too high; `annotations._read_words` recomputes the top from the pdfminer font and then matches poppler on every word of a real paper (max difference 1e-6 pt). The sort-index top is the floor of that corrected top (91 for the title). pdfplumber's default `x_tolerance=3` glues words of PDFs that have no space characters ("LargeLanguageModels(LLMs)"), so words are extracted with `x_tolerance_ratio=0.15`.
 - `update_item` raises on a rejected write (via `@backoff_check`); batch `update_items` does not check per-object failures in a 200 response.
 
 ## Library conventions

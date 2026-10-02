@@ -37,6 +37,9 @@ documentation = "https://pyzotero.readthedocs.org"
 [project.optional-dependencies]
 cli = ["click>=8.0.0"]
 mcp = ["mcp[cli]>=2.0.0; python_version>='3.10'"]
+pdf = [
+    "pdfplumber>=0.11.10",
+]
 
 [project.scripts]
 pyzotero = "pyzotero._entry:cli"
@@ -51,6 +54,7 @@ dev = [
     "pytest-asyncio",
     "pytest-cov>=6.0.0",
     "tzdata>=2025.2",
+    "pdfplumber>=0.11.10",
 ]
 doc = [
     "sphinx",
