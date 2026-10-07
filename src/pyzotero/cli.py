@@ -14,6 +14,7 @@ import click
 import httpx2
 
 from pyzotero import __version__, _files, annotations, notes
+from pyzotero._help import ExamplesGroup
 from pyzotero._config import (
     ENV_VARS,
     MODES,
@@ -84,12 +85,12 @@ def cli_error_handler(func: F) -> F:
 
 
 def _zot_from_ctx(ctx: Any) -> Any:
-    """Build a local-mode Zotero client using the locale from the CLI context."""
+    """Build a Zotero client for the configured mode, with the CLI locale."""
     return get_zotero_client(ctx.obj.get("locale", "en-US"))
 
 
 def _write_zot_from_ctx(ctx: Any) -> Any:
-    """Build a local-mode client that can write, from the stored local API key.
+    """Build a client that can write: remote mode, or the stored local API key.
 
     Raises RuntimeError, which the error handler reports, if no key is stored.
     """
@@ -173,7 +174,7 @@ def _run_s2_lookup(
 
     Fetches papers via ``lookup(doi, id_type="doi", limit=limit)``, applies
     the ``min_citations`` filter, optionally annotates each paper with its
-    presence in the local Zotero library, and prints the JSON payload.
+    presence in the Zotero library, and prints the JSON payload.
     ``label`` appears in the stderr progress message.
     """
     click.echo(f"Fetching {label} for DOI: {doi}...", err=True)
@@ -188,7 +189,7 @@ def _run_s2_lookup(
         return
 
     if check_library:
-        click.echo("Checking local Zotero library...", err=True)
+        click.echo("Checking Zotero library...", err=True)
         zot = _zot_from_ctx(ctx)
         doi_map = build_doi_index(zot)
         output_papers = annotate_with_library(papers, doi_map)
@@ -200,7 +201,7 @@ def _run_s2_lookup(
     )
 
 
-@click.group()
+@click.group(cls=ExamplesGroup)
 @click.version_option(version=__version__, prog_name="pyzotero")
 @click.option(
     "--locale",
@@ -274,7 +275,7 @@ def search(  # noqa: PLR0912, PLR0915
     offset: int,
     output_json: bool,
 ) -> None:
-    """Search local Zotero library.
+    """Search the Zotero library.
 
     By default, searches top-level items in titles and metadata.
 
@@ -457,7 +458,7 @@ def search(  # noqa: PLR0912, PLR0915
 @click.pass_context
 @cli_error_handler
 def listcollections(ctx: Any, limit: int | None) -> None:
-    """List all collections in the local Zotero library.
+    """List all collections in the Zotero library.
 
     Examples:
         pyzotero listcollections
@@ -670,7 +671,7 @@ def createitem(
     message names its position in the list. Zotero accepts up to 50 items
     in one call.
 
-    Needs a stored local API key: run 'pyzotero authorize' first.
+    Needs remote mode ('pyzotero setup') or a stored local API key ('pyzotero authorize').
 
     Examples:
         pyzotero createitem item.json
@@ -735,7 +736,7 @@ def createcollection(
 ) -> None:
     """Create a collection, at the top level or under --parent.
 
-    Needs a stored local API key: run 'pyzotero authorize' first.
+    Needs remote mode ('pyzotero setup') or a stored local API key ('pyzotero authorize').
 
     Examples:
         pyzotero createcollection "Frankenstein Cities"
@@ -779,7 +780,7 @@ def addtocollection(
 ) -> None:
     """Add one or more items to a collection.
 
-    Needs a stored local API key: run 'pyzotero authorize' first.
+    Needs remote mode ('pyzotero setup') or a stored local API key ('pyzotero authorize').
 
     Examples:
         pyzotero addtocollection FD9AUNP2 ABC123 DEF456
@@ -813,7 +814,7 @@ def removefromcollection(
 ) -> None:
     """Remove one or more items from a collection. The items are unchanged.
 
-    Needs a stored local API key: run 'pyzotero authorize' first.
+    Needs remote mode ('pyzotero setup') or a stored local API key ('pyzotero authorize').
 
     Examples:
         pyzotero removefromcollection FD9AUNP2 ABC123 DEF456
@@ -870,7 +871,7 @@ def movetocollection(
     one request. Membership of other collections is unchanged. An item that
     is not in the --from collection still joins the --to collection.
 
-    Needs a stored local API key: run 'pyzotero authorize' first.
+    Needs remote mode ('pyzotero setup') or a stored local API key ('pyzotero authorize').
 
     Examples:
         pyzotero movetocollection --from FD9AUNP2 --to X7Y8Z9W0 ABC123 DEF456
@@ -902,15 +903,23 @@ def movetocollection(
 @click.pass_context
 @cli_error_handler
 def test(ctx: Any) -> None:
-    """Test connection to local Zotero instance.
+    """Test the connection to the Zotero library.
 
-    This command checks whether Zotero is running and accepting local connections.
+    In local mode, checks that Zotero desktop is running and accepting local
+    connections. In remote mode, checks that zotero.org accepts the API key.
 
     Examples:
         pyzotero test
 
     """
     zot = _zot_from_ctx(ctx)
+    if load_settings().mode == "remote":
+        zot.key_info()  # raises, and the error handler reports, on a bad key
+        click.echo(
+            f"✓ Connection successful: zotero.org accepts the API key for "
+            f"{zot.library_type} library {zot.library_id}."
+        )
+        return
 
     try:
         # Call settings() to test the connection
@@ -1163,7 +1172,7 @@ def subset(ctx: Any, keys: tuple[str, ...], output_json: bool) -> None:
 @click.pass_context
 @cli_error_handler
 def alldoi(ctx: Any, dois: tuple[str, ...], output_json: bool) -> None:  # noqa: PLR0912
-    """Look up DOIs in the local Zotero library and return their Zotero IDs.
+    """Look up DOIs in the Zotero library and return their Zotero IDs.
 
     Accepts one or more DOIs as arguments and checks if they exist in the library.
     DOI matching is case-insensitive and handles common prefixes (https://doi.org/, doi:).
@@ -1304,7 +1313,7 @@ def fulltext(ctx: Any, key: str) -> None:
 @click.option(
     "--check-library/--no-check-library",
     default=True,
-    help="Check if papers exist in local Zotero (default: True)",
+    help="Check if papers exist in the Zotero library (default: True)",
 )
 @click.pass_context
 @cli_error_handler
@@ -1355,7 +1364,7 @@ def related(
 @click.option(
     "--check-library/--no-check-library",
     default=True,
-    help="Check if papers exist in local Zotero (default: True)",
+    help="Check if papers exist in the Zotero library (default: True)",
 )
 @click.pass_context
 @cli_error_handler
@@ -1398,7 +1407,7 @@ def citations(
 @click.option(
     "--check-library/--no-check-library",
     default=True,
-    help="Check if papers exist in local Zotero (default: True)",
+    help="Check if papers exist in the Zotero library (default: True)",
 )
 @click.pass_context
 @cli_error_handler
@@ -1456,7 +1465,7 @@ def references(
 @click.option(
     "--check-library/--no-check-library",
     default=True,
-    help="Check if papers exist in local Zotero (default: True)",
+    help="Check if papers exist in the Zotero library (default: True)",
 )
 @click.pass_context
 @cli_error_handler
@@ -1503,7 +1512,7 @@ def s2search(
 
     # Optionally annotate with library status
     if check_library:
-        click.echo("Checking local Zotero library...", err=True)
+        click.echo("Checking Zotero library...", err=True)
         zot = _zot_from_ctx(ctx)
         doi_map = build_doi_index(zot)
         output_papers = annotate_with_library(papers, doi_map)
@@ -2054,7 +2063,7 @@ def note_add(
     PARENT is the key of the item that gets the note as a child. Give 'none'
     for a standalone note, which can go in a collection with --collection.
 
-    Needs a stored local API key, or remote mode: see 'pyzotero setup'.
+    Needs remote mode ('pyzotero setup') or a stored local API key ('pyzotero authorize').
 
     Examples:
         pyzotero note add ABC12345 --text "Uses **tree-based** GP."
@@ -2235,7 +2244,7 @@ def highlight(
     dry_run: bool,
     output_json: bool,
 ) -> None:
-    """Highlight a phrase in the PDF of attachment or item KEY.
+    """Highlight a phrase or rectangles in the PDF of attachment or item KEY.
 
     The phrase is found in the PDF text (needs 'pip install pyzotero[pdf]')
     and stored as a Zotero highlight annotation. It may span lines, columns

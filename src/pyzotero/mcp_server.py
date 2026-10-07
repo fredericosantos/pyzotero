@@ -64,7 +64,7 @@ def _run_s2_tool_lookup(
 
     Fetches papers via ``lookup(doi, id_type="doi", limit=limit)``, applies
     the ``min_citations`` filter, optionally annotates each paper with its
-    presence in the local Zotero library, and serialises the payload.
+    presence in the Zotero library, and serialises the payload.
     """
     result = lookup(doi, id_type="doi", limit=limit)
     papers = result.get("papers", [])
@@ -119,7 +119,7 @@ def search(  # noqa: PLR0912
     limit: int = 50,
     offset: int = 0,
 ) -> str:
-    """Search the local Zotero library.
+    """Search the Zotero library.
 
     Args:
         query: Search query string.
@@ -244,7 +244,7 @@ def get_children(key: str) -> str:
 @mcp.tool()
 @mcp_error_handler
 def list_collections(limit: int = 0) -> str:
-    """List all collections in the local Zotero library.
+    """List all collections in the Zotero library.
 
     Args:
         limit: Maximum number of collections to return (0 for all).
@@ -489,7 +489,7 @@ def find_related(
         doi: DOI of the paper.
         limit: Maximum results (default 20, max 500).
         min_citations: Minimum citation count filter.
-        check_library: If true, annotate results with local Zotero presence.
+        check_library: If true, annotate results with presence in the Zotero library.
 
     Returns:
         JSON with count and papers list.
@@ -514,7 +514,7 @@ def get_citations(
         doi: DOI of the paper.
         limit: Maximum results (default 100, max 1000).
         min_citations: Minimum citation count filter.
-        check_library: If true, annotate results with local Zotero presence.
+        check_library: If true, annotate results with presence in the Zotero library.
 
     Returns:
         JSON with count and papers list.
@@ -539,7 +539,7 @@ def get_references(
         doi: DOI of the paper.
         limit: Maximum results (default 100, max 1000).
         min_citations: Minimum citation count filter.
-        check_library: If true, annotate results with local Zotero presence.
+        check_library: If true, annotate results with presence in the Zotero library.
 
     Returns:
         JSON with count and papers list.
@@ -570,7 +570,7 @@ def search_semantic_scholar(
         open_access: Only return open access papers.
         sort: Sort by "citations" or "year" (descending).
         min_citations: Minimum citation count filter.
-        check_library: If true, annotate results with local Zotero presence.
+        check_library: If true, annotate results with presence in the Zotero library.
 
     Returns:
         JSON with count, total, and papers list.
@@ -653,7 +653,7 @@ def _register_item_tools(add: AddTool) -> None:
         tags: list[str] | None = None,
         collections: list[str] | None = None,
     ) -> str:
-        """Create a new item in the local Zotero library.
+        """Create a new item in the Zotero library.
 
         Args:
             item_type: A Zotero item type, e.g. "journalArticle" or "book".
@@ -1073,7 +1073,7 @@ def _register_delete_tools(add: AddTool) -> None:
     """Register the delete tools. This runs only for --enable-deletes."""
 
     def delete_item(key: str) -> str:
-        """Permanently delete an item from the local Zotero library.
+        """Permanently delete an item from the Zotero library.
 
         You cannot undo this operation. The local API erases the item. It
         does not move the item to the trash. If the library syncs, the
