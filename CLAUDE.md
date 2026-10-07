@@ -5,7 +5,7 @@ Fork of [urschrei/pyzotero](https://github.com/urschrei/pyzotero) at `fredericos
 ## Git
 
 - `origin` is the fork, `upstream` is urschrei. Merge into the fork's `main` only; never open a PR or push to upstream without an explicit request.
-- Keep fork-only code in its own modules (`_config.py`, `_files.py`, `webdav.py`, `openaccess.py`, `duplicates.py`, `notes.py`, `annotations.py`) and keep edits to upstream files small, so rebasing onto upstream stays cheap.
+- Keep fork-only code in its own modules (`_config.py`, `_files.py`, `_help.py`, `webdav.py`, `openaccess.py`, `duplicates.py`, `notes.py`, `annotations.py`) and keep edits to upstream files small, so rebasing onto upstream stays cheap.
 - Worktrees: `.claude/worktrees/<name>` (gitignored).
 
 ## Checks
