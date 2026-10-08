@@ -2,8 +2,9 @@
 
 from click.testing import CliRunner
 
+from pyzotero import errors as ze
 from pyzotero._help import split_examples
-from pyzotero.cli import main
+from pyzotero.cli import _not_authorised_message, main
 
 
 def test_split_examples():
@@ -34,3 +35,16 @@ def test_examples_are_printed_verbatim():
 def test_subgroup_commands_use_examples_class():
     out = CliRunner().invoke(main, ["note", "add", "--help"]).output
     assert "\nExamples:\n" in out
+
+
+def test_remote_403_message_hides_url(monkeypatch):
+    err = ze.UserNotAuthorisedError(
+        "\nCode: 403\nURL: https://api.zotero.org/keys/SECRET\nMethod: GET\n"
+        "Response: Invalid key"
+    )
+    monkeypatch.setenv("PYZOTERO_MODE", "remote")
+    msg = _not_authorised_message(err)
+    assert "Invalid key" in msg
+    assert "SECRET" not in msg
+    monkeypatch.setenv("PYZOTERO_MODE", "local")
+    assert _not_authorised_message(err) == str(err)

@@ -14,6 +14,7 @@ import click
 import httpx2
 
 from pyzotero import __version__, _files, annotations, notes
+from pyzotero import errors as ze
 from pyzotero._help import ExamplesGroup
 from pyzotero._config import (
     ENV_VARS,
@@ -55,6 +56,25 @@ from pyzotero.zotero import chunks
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+def _not_authorised_message(e: ze.UserNotAuthorisedError) -> str:
+    """Explain a 401/403 from zotero.org without the request URL.
+
+    The URL of a /keys/ request contains the API key, and the cause is
+    almost always the key or the library ID, which setup can show and fix.
+    """
+    if type(e) is not ze.UserNotAuthorisedError or load_settings().mode != "remote":
+        return str(e)  # local-API errors carry their own hints
+    # The server's reason ("Invalid key", "Write access denied", ...) is the
+    # last field of errors._err_msg.
+    reason = str(e).partition("Response: ")[2].strip() or "not authorised"
+    return (
+        f"zotero.org refused the request: {reason}. The API key may be wrong, "
+        "revoked, read-only, or without access to this library. Check the "
+        "settings with 'pyzotero setup --show'; save a new key with "
+        "'pyzotero setup'."
+    )
+
+
 def cli_error_handler(func: F) -> F:
     """Map exceptions raised in a CLI command to stderr messages + exit 1.
 
@@ -76,6 +96,9 @@ def cli_error_handler(func: F) -> F:
             sys.exit(1)
         except SemanticScholarError as e:
             click.echo(f"Error: {e!s}", err=True)
+            sys.exit(1)
+        except ze.UserNotAuthorisedError as e:
+            click.echo(f"Error: {_not_authorised_message(e)}", err=True)
             sys.exit(1)
         except Exception as e:
             click.echo(f"Error: {e!s}", err=True)
@@ -914,7 +937,10 @@ def test(ctx: Any) -> None:
     """
     zot = _zot_from_ctx(ctx)
     if load_settings().mode == "remote":
-        zot.key_info()  # raises, and the error handler reports, on a bad key
+        # Each raises, and the error handler reports, on a bad key or a
+        # library the key cannot read.
+        zot.key_info()
+        zot.num_items()
         click.echo(
             f"✓ Connection successful: zotero.org accepts the API key for "
             f"{zot.library_type} library {zot.library_id}."
@@ -1239,6 +1265,7 @@ def doiindex(ctx: Any) -> None:
     Returns a JSON mapping of normalised DOIs to item keys and original DOIs.
     This allows the skill to cache the index and avoid repeated full-library scans.
 
+    \b
     Output format:
         {
           "10.1234/abc": {"key": "ABC123", "original": "https://doi.org/10.1234/ABC"},
@@ -1270,6 +1297,7 @@ def fulltext(ctx: Any, key: str) -> None:
     Returns the full-text content extracted from a PDF or other attachment.
     The key should be the key of an attachment item (not a top-level item).
 
+    \b
     Output format:
         {
           "content": "Full-text extracted from PDF...",
