@@ -32,6 +32,7 @@ import math
 import re
 import tempfile
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from itertools import islice, pairwise
 from pathlib import Path
@@ -504,8 +505,9 @@ def _payload(
     sort_key: str,
     color: str,
     comment: str,
+    author: str = "",
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "itemType": "annotation",
         "parentItem": attachment,
         "annotationType": "highlight",
@@ -520,10 +522,19 @@ def _payload(
         "tags": [],
         "relations": {},
     }
+    if author:
+        # Shown by the desktop reader as the annotation's author; zotero.org
+        # keeps it in a personal library too (checked live, 2026-10).
+        payload["annotationAuthorName"] = author
+    return payload
 
 
 def build_payload(
-    attachment: str, segment: Segment, color: str, comment: str = ""
+    attachment: str,
+    segment: Segment,
+    color: str,
+    comment: str = "",
+    author: str = "",
 ) -> dict[str, Any]:
     """Return the annotation item that the Zotero API creates for a segment."""
     return _payload(
@@ -534,6 +545,7 @@ def build_payload(
         sort_index(segment),
         color,
         comment,
+        author,
     )
 
 
@@ -603,6 +615,7 @@ def list_annotations(zot: Zotero, key: str) -> list[dict[str, Any]]:
             "page": data.get("annotationPageLabel"),
             "text": data.get("annotationText", ""),
             "comment": data.get("annotationComment", ""),
+            "author": data.get("annotationAuthorName", ""),
         }
         for att in pdf_attachments(zot, key)
         for data in sorted(
@@ -626,11 +639,13 @@ def find_duplicate(
 ) -> str | None:
     """Return the key of a highlight that already covers ``payload``, or None.
 
-    Same page, same normalized text, and rects that overlap. The overlap
-    keeps two occurrences of one phrase on a page apart.
+    Same page, same normalized text, same author name, and rects that
+    overlap. The overlap keeps two occurrences of one phrase on a page apart;
+    the author keeps two reviewers' highlights of one phrase apart.
     """
     position = json.loads(payload["annotationPosition"])
     text = normalize(payload["annotationText"])
+    author = payload.get("annotationAuthorName", "")
     for data in existing:
         if data.get("annotationType") != "highlight":
             continue
@@ -638,6 +653,7 @@ def find_duplicate(
         if (
             other.get("pageIndex") == position["pageIndex"]
             and normalize(data.get("annotationText", "")) == text
+            and data.get("annotationAuthorName", "") == author
             and _overlaps(position["rects"], other.get("rects", []))
         ):
             return data["key"]
@@ -653,6 +669,7 @@ def _entry(status: str, payload: dict[str, Any], key: str | None) -> dict[str, A
         "label": payload["annotationPageLabel"],
         "text": payload["annotationText"],
         "color": payload["annotationColor"],
+        "author": payload.get("annotationAuthorName", ""),
         "sortIndex": payload["annotationSortIndex"],
         "rects": position["rects"],
     }
@@ -666,6 +683,10 @@ def _first_attachment(zot: Zotero, key: str) -> str:
     return attachments[0]["key"]
 
 
+# Zotero's limit of objects per write request.
+BATCH_SIZE = 50
+
+
 def _store(
     zot: Zotero,
     attachment: str,
@@ -673,7 +694,11 @@ def _store(
     found: int,
     dry_run: bool,
 ) -> dict[str, Any]:
-    """Create the payloads that do not exist yet, and report each one."""
+    """Create the payloads that do not exist yet, and report each one.
+
+    Writes go in batches of BATCH_SIZE. A payload that Zotero rejects is
+    reported as ``failed`` with the server's reason; the others still count.
+    """
     existing = _annotations_of(zot, attachment)
     entries: list[dict[str, Any]] = []
     pending: list[tuple[int, dict[str, Any]]] = []
@@ -683,21 +708,32 @@ def _store(
         else:
             pending.append((len(entries), payload))
             entries.append(_entry("planned", payload, None))
-    if pending and not dry_run:
-        response = zot.create_items([p for _, p in pending])
+    for start in range(0, 0 if dry_run else len(pending), BATCH_SIZE):
+        batch = pending[start : start + BATCH_SIZE]
+        response = zot.create_items([p for _, p in batch])
         success = response.get("success") or {}
-        if len(success) != len(pending):
-            msg = f"Zotero rejected the highlight: {response.get('failed')}"
-            raise RuntimeError(msg)
-        for n, (slot, _) in enumerate(pending):
-            entries[slot]["status"] = "created"
-            entries[slot]["key"] = success[str(n)]
+        failed = response.get("failed") or {}
+        for n, (slot, _) in enumerate(batch):
+            if str(n) in success:
+                entries[slot]["status"] = "created"
+                entries[slot]["key"] = success[str(n)]
+            else:
+                entries[slot]["status"] = "failed"
+                entries[slot]["error"] = failed.get(str(n), "no response")
     return {
         "attachment": attachment,
         "dry_run": dry_run,
         "found": found,
         "highlights": entries,
     }
+
+
+def _raise_on_failure(result: dict[str, Any]) -> dict[str, Any]:
+    failed = [h["error"] for h in result["highlights"] if h["status"] == "failed"]
+    if failed:
+        msg = f"Zotero rejected the highlight: {failed}"
+        raise RuntimeError(msg)
+    return result
 
 
 def highlight(
@@ -707,6 +743,7 @@ def highlight(
     *,
     color: str = "yellow",
     comment: str = "",
+    author: str = "",
     page: int = 0,
     occurrence: int = 0,
     all_matches: bool = False,
@@ -736,11 +773,11 @@ def highlight(
         raise LookupError(msg)
     chosen = select(matches, text, occurrence, all_matches)
     payloads = [
-        build_payload(attachment, segment, color, comment)
+        build_payload(attachment, segment, color, comment, author)
         for match in chosen
         for segment in match.segments
     ]
-    return _store(zot, attachment, payloads, len(matches), dry_run)
+    return _raise_on_failure(_store(zot, attachment, payloads, len(matches), dry_run))
 
 
 # Rectangles may stick out of the page box by this much (points): hand-made
@@ -811,6 +848,7 @@ def highlight_rects(
     text: str = "",
     color: str = "yellow",
     comment: str = "",
+    author: str = "",
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Highlight rectangles on one page of the PDF of ``key``.
@@ -824,7 +862,7 @@ def highlight_rects(
 
     The result has the shape of :func:`highlight`'s, with one entry. A
     highlight on the same page with overlapping rects and the same text is
-    ``unchanged``, whatever its color. Raises ValueError for bad rects or a
+    ``unchanged``, whatever its color, if it has the same author name. Raises ValueError for bad rects or a
     rotated page, IndexError for a page out of range, LookupError if no
     attachment is found or no word is in the rects and ``text`` is empty.
     """
@@ -852,5 +890,112 @@ def highlight_rects(
     sort_key = _sort_key(
         target.index, offset, target.box[3] - max(rect[3] for rect in checked)
     )
-    payload = _payload(attachment, target, text, checked, sort_key, color, comment)
-    return _store(zot, attachment, [payload], 1, dry_run)
+    payload = _payload(
+        attachment, target, text, checked, sort_key, color, comment, author
+    )
+    return _raise_on_failure(_store(zot, attachment, [payload], 1, dry_run))
+
+
+ENTRY_FIELDS = {"page", "text", "color", "comment", "author"}
+
+
+def check_entries(
+    entries: Any, color: str = "yellow", comment: str = "", author: str = ""
+) -> list[dict[str, Any]]:
+    """Validate bulk highlight entries and fill in the defaults.
+
+    Each entry is ``{"page": int (1-based), "text": str, "color", "comment",
+    "author"}``; the last three are optional and default to the arguments.
+    Raises ValueError naming the first bad entry (1-based), so that nothing
+    is written for a file with a mistake in it.
+    """
+    if not isinstance(entries, list) or not entries:
+        msg = "Give a non-empty JSON list of entries"
+        raise ValueError(msg)
+    checked = []
+    for n, entry in enumerate(entries, 1):
+        where = f"Entry {n}"
+        if not isinstance(entry, dict):
+            msg = f"{where} is not an object"
+            raise ValueError(msg)  # noqa: TRY004 - a JSON content error
+        if unknown := set(entry) - ENTRY_FIELDS:
+            msg = f"{where} has unknown fields {sorted(unknown)}; allowed: {sorted(ENTRY_FIELDS)}"
+            raise ValueError(msg)
+        page = entry.get("page")
+        if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+            msg = f"{where}: page must be an integer from 1"
+            raise ValueError(msg)
+        filled = {"color": color, "comment": comment, "author": author, **entry}
+        for name in ("text", "color", "comment", "author"):
+            if not isinstance(filled[name], str):
+                msg = f"{where}: {name} must be a string"
+                raise ValueError(msg)  # noqa: TRY004 - a JSON content error
+        if not normalize(filled["text"]):
+            msg = f"{where}: text is empty"
+            raise ValueError(msg)
+        try:
+            parse_color(filled["color"])
+        except ValueError as e:
+            msg = f"{where}: {e}"
+            raise ValueError(msg) from e
+        checked.append(filled)
+    return checked
+
+
+def highlight_entries(
+    zot: Zotero,
+    key: str,
+    entries: list[dict[str, Any]],
+    *,
+    ignore_case: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Highlight many phrases, each on its own page, in the PDF of ``key``.
+
+    ``entries`` come from :func:`check_entries`. Each phrase is matched as
+    :func:`highlight` matches it, on its page only; when it occurs more than
+    once there, the first occurrence is used. The PDF is downloaded once.
+
+    Returns ``{"attachment", "dry_run", "counts", "entries": [...]}`` with one
+    row per entry, in input order, numbered from 1 by ``index``: ``status``
+    is ``created``, ``planned`` (dry run), ``unchanged`` (a highlight with the
+    same text and author covers it), ``unmatched`` (with the ``closest``
+    passages on its page) or ``failed`` (Zotero rejected it: ``error``).
+    """
+    attachment = _first_attachment(zot, key)
+    with tempfile.TemporaryDirectory() as tmp:
+        downloaded = _files.download(zot, attachment, Path(tmp))
+        pages = load_pages(Path(downloaded["path"]))
+    rows: list[dict[str, Any] | None] = [None] * len(entries)
+    payloads: list[dict[str, Any]] = []
+    owners: list[int] = []  # entry index of each payload
+    for n, entry in enumerate(entries):
+        page_no, text = entry["page"], entry["text"]
+        unmatched = {"index": n + 1, "status": "unmatched", "key": None}
+        if page_no > len(pages):
+            rows[n] = {**unmatched, "page": page_no, "text": text, "closest": [],
+                       "error": f"the PDF has {len(pages)} pages"}  # fmt: skip
+            continue
+        on_page = [pages[page_no - 1]]
+        matches = find_matches(on_page, text, ignore_case)
+        if not matches:
+            rows[n] = {**unmatched, "page": page_no, "text": text,
+                       "closest": closest(on_page, text)}  # fmt: skip
+            continue
+        (segment,) = matches[0].segments  # one page: one segment
+        payloads.append(
+            build_payload(
+                attachment, segment, entry["color"], entry["comment"], entry["author"]
+            )
+        )
+        owners.append(n)
+    stored = _store(zot, attachment, payloads, len(payloads), dry_run)
+    for n, row in zip(owners, stored["highlights"], strict=True):
+        rows[n] = {"index": n + 1, **row}
+    done = [r for r in rows if r is not None]
+    return {
+        "attachment": attachment,
+        "dry_run": dry_run,
+        "counts": dict(Counter(r["status"] for r in done)),
+        "entries": done,
+    }
