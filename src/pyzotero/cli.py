@@ -2243,6 +2243,21 @@ def note_append(
 )
 @click.option("--comment", default="", help="Comment to store on the highlight")
 @click.option(
+    "--author",
+    default="",
+    help="Author name to show on the highlight (annotationAuthorName)",
+)
+@click.option(
+    "--from",
+    "source",
+    type=click.File("r"),
+    help=(
+        "Highlight many phrases from a JSON file ('-' for stdin): a list of "
+        '{"page", "text", "color", "comment", "author"}. --color, --comment '
+        "and --author fill in missing fields. Not with --text or --rect"
+    ),
+)
+@click.option(
     "--page", type=click.IntRange(min=1), help="Search only this page (1-based)"
 )
 @click.option(
@@ -2265,6 +2280,8 @@ def highlight(
     rects: tuple[tuple[int, float, float, float, float], ...],
     color: str,
     comment: str,
+    author: str,
+    source: IO[str] | None,
     page: int | None,
     occurrence: int | None,
     all_matches: bool,
@@ -2285,7 +2302,15 @@ def highlight(
     the text of the PDF words inside them. Coordinates are PDF user space in
     points with the origin at the bottom left, as in Zotero's annotation
     position. A rect that overlaps an existing highlight with the same text
-    is reported as unchanged, whatever its color.
+    is reported as unchanged, whatever its color. A highlight with another
+    --author is never a duplicate.
+
+    With --from, each entry's phrase is matched on its page only, taking the
+    first occurrence. The whole file is checked before anything is written,
+    the PDF is downloaded once, and writes go in batches of 50. Each entry is
+    reported as created, unchanged (already exists), unmatched (with the
+    closest passages on its page) or failed; the command exits 1 if any
+    write failed.
 
     Examples:
         pyzotero highlight ABC12345 --text "we introduce a new method"
@@ -2296,9 +2321,21 @@ def highlight(
 
         pyzotero highlight ABC12345 --text "baseline" --all --dry-run
 
+        pyzotero highlight ABC12345 --text "unclear" --author "Reviewer 2" --color purple
+
+        pyzotero highlight ABC12345 --from comments.json --dry-run
+
     """
+    if source is not None:
+        if text or rects or page or occurrence or all_matches:
+            msg = "--from goes without --text, --rect, --page, --occurrence and --all"
+            raise click.UsageError(msg)
+        _highlight_from(
+            ctx, key, source, color, comment, author, ignore_case, dry_run, output_json
+        )
+        return
     if bool(text) == bool(rects):
-        msg = "Give --text or --rect, not both and not neither"
+        msg = "Give --text or --rect, not both and not neither (or --from)"
         raise click.UsageError(msg)
     if occurrence and all_matches:
         msg = "Give --occurrence or --all, not both"
@@ -2318,6 +2355,7 @@ def highlight(
             [list(r[1:]) for r in rects],
             color=color,
             comment=comment,
+            author=author,
             dry_run=dry_run,
         )
     else:
@@ -2327,6 +2365,7 @@ def highlight(
             text or "",
             color=color,
             comment=comment,
+            author=author,
             page=page or 0,
             occurrence=occurrence or 0,
             all_matches=all_matches,
@@ -2342,6 +2381,49 @@ def highlight(
         )
     if dry_run:
         click.echo("Nothing changed: this was a dry run.")
+
+
+def _highlight_from(
+    ctx: Any,
+    key: str,
+    source: IO[str],
+    color: str,
+    comment: str,
+    author: str,
+    ignore_case: bool,
+    dry_run: bool,
+    output_json: bool,
+) -> None:
+    """Run 'highlight --from': many phrases from a JSON file."""
+    try:
+        raw = json.load(source)
+    except json.JSONDecodeError as e:
+        msg = f"--from is not valid JSON: {e}"
+        raise click.UsageError(msg) from e
+    entries = annotations.check_entries(raw, color, comment, author)
+    zot = _zot_from_ctx(ctx) if dry_run else _write_zot_from_ctx(ctx)
+    result = annotations.highlight_entries(
+        zot, key, entries, ignore_case=ignore_case, dry_run=dry_run
+    )
+    if output_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        for r in result["entries"]:
+            label = r.get("label") or r["page"]
+            click.echo(
+                f"{r['index']:3}  {r['status']:9}  {r['key'] or '-':8}  "
+                f"p.{label}  {r['text'][:60]}"
+            )
+            if r["status"] == "failed":
+                click.echo(f"     {r['error']}")
+            for near in r.get("closest", []):
+                click.echo(f"     closest: {near}")
+        counts = ", ".join(f"{v} {k}" for k, v in result["counts"].items())
+        click.echo(f"{len(result['entries'])} entries: {counts}")
+        if dry_run:
+            click.echo("Nothing changed: this was a dry run.")
+    if result["counts"].get("failed"):
+        sys.exit(1)
 
 
 @main.command("annotations")
@@ -2369,6 +2451,8 @@ def annotations_command(ctx: Any, key: str, output_json: bool) -> None:
         line = (
             f"{r['key']}  {r['type']:9}  {r['color']}  p.{r['page']}  {r['text'][:60]}"
         )
+        if r["author"]:
+            line = f"{line}  [{r['author']}]"
         click.echo(f"{line}  // {r['comment']}" if r["comment"] else line)
     click.echo(f"{len(rows)} annotations")
 

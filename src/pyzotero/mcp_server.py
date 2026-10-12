@@ -882,6 +882,7 @@ def _register_annotation_tools(add: AddTool) -> None:
         comment: str = "",
         page: int = 0,
         occurrence: int = 0,
+        author: str = "",
     ) -> str:
         """Highlight a phrase in a PDF, as a Zotero highlight annotation.
 
@@ -902,6 +903,8 @@ def _register_annotation_tools(add: AddTool) -> None:
             occurrence: If the phrase occurs more than once, which match to
                 highlight (1-based). 0 means the phrase must occur once;
                 otherwise the call fails and lists each match with its page.
+            author: Optional author name shown on the highlight. A
+                highlight by another author is never a duplicate.
 
         Returns:
             JSON with the attachment key and, per highlight, its status
@@ -917,6 +920,7 @@ def _register_annotation_tools(add: AddTool) -> None:
                 text,
                 color=color,
                 comment=comment,
+                author=author,
                 page=page,
                 occurrence=occurrence,
             )
@@ -929,6 +933,7 @@ def _register_annotation_tools(add: AddTool) -> None:
         text: str = "",
         color: str = "yellow",
         comment: str = "",
+        author: str = "",
     ) -> str:
         """Highlight rectangles on one PDF page, as a Zotero highlight annotation.
 
@@ -949,6 +954,7 @@ def _register_annotation_tools(add: AddTool) -> None:
             color: A Zotero color name (yellow, red, green, blue, purple,
                 magenta, orange, gray) or ``#rrggbb``.
             comment: Optional comment to store on the highlight.
+            author: Optional author name shown on the highlight.
 
         Returns:
             JSON with the attachment key and one highlight: its status
@@ -967,6 +973,7 @@ def _register_annotation_tools(add: AddTool) -> None:
                 text=text,
                 color=color,
                 comment=comment,
+                author=author,
             )
         )
 

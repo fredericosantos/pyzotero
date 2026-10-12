@@ -816,7 +816,11 @@ class TestCropBoxAndMediaBox:
 class TestListAnnotations:
     def test_rows_in_reading_order(self, zot, pages):
         late = annotations.build_payload(
-            "ATT00001", one(pages, "story continues").segments[0], "green", "later"
+            "ATT00001",
+            one(pages, "story continues").segments[0],
+            "green",
+            "later",
+            "Reviewer 1",
         )
         early = annotations.build_payload(
             "ATT00001", one(pages, "quick brown").segments[0], "yellow"
@@ -836,6 +840,7 @@ class TestListAnnotations:
             "page": "2",
             "text": "story continues",
             "comment": "later",
+            "author": "Reviewer 1",
         }
 
 
@@ -1067,3 +1072,83 @@ class TestMcp:
         assert result["highlights"][0]["status"] == "created"
         assert result["highlights"][0]["text"] == "quick brown"
         assert "x0 < x1" in bad["error"]
+
+
+class TestAuthorAndBulk:
+    def test_author_is_stored_and_separates_duplicates(self, zot, pages):
+        seg = one(pages, "quick brown").segments[0]
+        zot.children.return_value = [
+            annotation_child(annotations.build_payload("ATT00001", seg, "yellow"))
+        ]
+        result = annotations.highlight(zot, "ATT00001", "quick brown", author="R2")
+        assert result["highlights"][0]["status"] == "created"
+        assert created(zot)["annotationAuthorName"] == "R2"
+        assert "annotationAuthorName" not in annotations.build_payload(
+            "ATT00001", seg, "yellow"
+        )
+
+    def test_check_entries(self):
+        (entry,) = annotations.check_entries(
+            [{"page": 1, "text": "x"}], color="red", author="R1"
+        )
+        assert entry == {
+            "page": 1,
+            "text": "x",
+            "color": "red",
+            "comment": "",
+            "author": "R1",
+        }
+        for bad, message in [
+            ([{"page": 0, "text": "x"}], "Entry 1: page"),
+            (
+                [{"page": 1, "text": "x"}, {"page": 1, "txt": "x"}],
+                "Entry 2 has unknown",
+            ),
+            ([{"page": 1, "text": "x", "color": "plaid"}], "Entry 1: "),
+            ({"page": 1}, "JSON list"),
+        ]:
+            with pytest.raises(ValueError, match=message):
+                annotations.check_entries(bad)
+
+    def test_dry_run_from_file_resolves_both_entries(self, zot, pages, tmp_path):
+        source = tmp_path / "comments.json"
+        source.write_text(
+            json.dumps(
+                [
+                    {"page": 1, "text": "quick brown", "color": "red",
+                     "comment": "vague", "author": "Reviewer 1"},
+                    {"page": 2, "text": "A repeated phrase.", "author": "Reviewer 2"},
+                ]
+            )
+        )  # fmt: skip
+        with (
+            patch("pyzotero.cli.get_write_client") as write,
+            patch("pyzotero.cli.get_zotero_client", return_value=zot),
+        ):
+            result = CliRunner().invoke(
+                cli.main,
+                ["highlight", "ATT00001", "--from", str(source), "--dry-run", "--json"],
+            )
+        assert result.exit_code == 0, result.output
+        write.assert_not_called()
+        zot.create_items.assert_not_called()
+        out = json.loads(result.output)
+        assert out["counts"] == {"planned": TWO}
+        first, second = out["entries"]
+        assert (first["index"], first["page"], first["text"]) == (1, 1, "quick brown")
+        assert (first["color"], first["author"]) == ("#ff6666", "Reviewer 1")
+        assert (second["page"], second["author"]) == (TWO, "Reviewer 2")
+        # The phrase occurs twice on page 2: the first occurrence is taken.
+        first_match = annotations.find_matches(pages[1:], "A repeated phrase.")[0]
+        assert second["rects"] == first_match.segments[0].rects
+
+    def test_unmatched_and_batches_of_50(self, zot):
+        entries = annotations.check_entries(
+            [{"page": 1, "text": "quick brown", "author": f"R{n}"} for n in range(51)]
+            + [{"page": 1, "text": "not in the pdf"}, {"page": 9, "text": "x"}]
+        )
+        result = annotations.highlight_entries(zot, "ATT00001", entries)
+        assert [len(c.args[0]) for c in zot.create_items.call_args_list] == [50, 1]
+        assert result["counts"] == {"created": 51, "unmatched": TWO}
+        assert result["entries"][51]["closest"]
+        assert "2 pages" in result["entries"][52]["error"]
