@@ -1614,6 +1614,38 @@ class Zotero:
             headers=headers,
         )
 
+    def _unchanged_library_version(
+        self, payload: list[dict[str, Any]], base: str, key_param: str
+    ) -> int:
+        """Return the library version, after checking that no object changed.
+
+        Reads the objects of ``payload`` again. Raises PreConditionFailedError
+        if one has a newer version than ``payload`` holds, as a single-object
+        delete would; an object that no longer exists is skipped. The library
+        version of the same response then guards the delete against changes
+        made after this read.
+        """
+        keys = ",".join(p["key"] for p in payload)
+        resp = self._send(
+            "GET",
+            build_url(self.endpoint, base),
+            params={key_param: keys, "format": "versions"},
+        )
+        try:
+            resp.raise_for_status()
+        except httpx2.HTTPStatusError as exc:
+            error_handler(self, resp, exc)
+        current = resp.json()
+        for p in payload:
+            now = current.get(p["key"])
+            if now is not None and now != p["version"]:
+                msg = (
+                    f"{p['key']} changed since it was read: version "
+                    f"{p['version']}, now {now}"
+                )
+                raise ze.PreConditionFailedError(msg)
+        return int(resp.headers["Last-Modified-Version"])
+
     def _delete_entity(
         self,
         payload: dict[str, Any] | list[dict[str, Any]],
@@ -1630,9 +1662,17 @@ class Zotero:
         base = f"/{self.library_type}/{self.library_id}/{collection}"
         if isinstance(payload, list):
             params = {key_param: ",".join([p["key"] for p in payload])}
-            modified = (
-                last_modified if last_modified is not None else payload[0]["version"]
-            )
+            # A multi-object DELETE takes the LIBRARY version, which is newer
+            # than any one object's version as soon as anything else in the
+            # library changes, so an object's version gave a 412.
+            # The local API is left as it was: whether it supports
+            # format=versions was not checked (no desktop app on the server).
+            if last_modified is not None:
+                modified = last_modified
+            elif self.local:
+                modified = payload[0]["version"]
+            else:
+                modified = self._unchanged_library_version(payload, base, key_param)
             url = build_url(self.endpoint, base)
         else:
             params = None

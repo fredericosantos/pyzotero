@@ -18,6 +18,7 @@ import pytz
 import whenever
 from dateutil import parser
 
+from pyzotero import errors as ze
 from pyzotero._utils import MAX_RETRY_ATTEMPTS
 
 from .mock_client import MockClient
@@ -1110,9 +1111,15 @@ class ZoteroTests(unittest.TestCase):
         mock = MockClient()
         zot = z.Zotero("myuserID", "user", "myuserkey", client=mock.client)
 
-        # Mock the DELETE endpoint for multiple items
+        # Mock the DELETE endpoint for multiple items, and the version check
         mock.register(
             "DELETE", "https://api.zotero.org/users/myuserID/items", status=204
+        )
+        mock.register(
+            "GET",
+            "https://api.zotero.org/users/myuserID/items",
+            body=json.dumps({"ITEM1": 5, "ITEM2": 3}),
+            headers={"Last-Modified-Version": 42},
         )
 
         # Create test items
@@ -1124,7 +1131,8 @@ class ZoteroTests(unittest.TestCase):
         # Verify the request
         request = mock.last_request()
         self.assertEqual(request.method, "DELETE")
-        self.assertEqual(request.headers["If-Unmodified-Since-Version"], "5")
+        # The library version, not one item's version
+        self.assertEqual(request.headers["If-Unmodified-Since-Version"], "42")
 
         # Extract and parse the query string
         parsed_url = urlparse(request.url)
@@ -1134,6 +1142,21 @@ class ZoteroTests(unittest.TestCase):
         self.assertEqual(query_params["itemKey"][0], "ITEM1,ITEM2")
 
         self.assertTrue(resp)
+
+    def testDeleteMultipleItemsRefusesAChangedItem(self):
+        """A multi-item delete fails if an item changed since it was read"""
+        mock = MockClient()
+        zot = z.Zotero("myuserID", "user", "myuserkey", client=mock.client)
+        mock.register(
+            "GET",
+            "https://api.zotero.org/users/myuserID/items",
+            body=json.dumps({"ITEM1": 6, "ITEM2": 3}),
+            headers={"Last-Modified-Version": 42},
+        )
+        items = [{"key": "ITEM1", "version": 5}, {"key": "ITEM2", "version": 3}]
+        with self.assertRaises(ze.PreConditionFailedError):
+            zot.delete_item(items)
+        self.assertEqual(mock.last_request().method, "GET")
 
     def testFileUpload(self):
         """Tests file upload process with attachments"""
